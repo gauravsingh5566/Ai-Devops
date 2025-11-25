@@ -1,0 +1,82 @@
+version: '3.8'
+
+services:
+  infra-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: infra-service
+    ports:
+      - "8004:8004"
+    environment:
+      # Service configuration
+      - SERVICE_NAME=infra-service
+      - SERVICE_PORT=8004
+      - DEBUG=false
+      
+      # Terraform Configuration
+      - TERRAFORM_VERSION=1.6.6
+      - WORKSPACE_DIR=/app/workspaces
+      - STATE_BACKEND=local
+      
+      # AWS Configuration (required for Terraform to deploy to AWS)
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      
+      # Deployment Settings
+      - DEFAULT_AUTO_APPROVE=false
+      - MAX_CONCURRENT_DEPLOYMENTS=5
+      - DEPLOYMENT_TIMEOUT=300
+      
+      # State Management (optional - for S3 backend)
+      # - S3_STATE_BUCKET=${S3_STATE_BUCKET}
+      # - S3_STATE_KEY_PREFIX=terraform-state
+      # - DYNAMODB_LOCK_TABLE=${DYNAMODB_LOCK_TABLE}
+      
+      # Other microservices URLs
+      - AI_SERVICE_URL=http://ai-service:8001
+      - RAG_SERVICE_URL=http://rag-service:8002
+      - MCP_SERVICE_URL=http://mcp-service:8003
+      
+      # Logging
+      - LOG_LEVEL=INFO
+      - LOG_FORMAT=json
+      - SAVE_TERRAFORM_LOGS=true
+    
+    # Persist workspace data
+    volumes:
+      - infra-workspaces:/app/workspaces
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8004/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    
+    # Restart policy
+    restart: unless-stopped
+    
+    # Network
+    networks:
+      - ai-devops-network
+
+volumes:
+  infra-workspaces:
+    driver: local
+
+networks:
+  ai-devops-network:
+    driver: bridge

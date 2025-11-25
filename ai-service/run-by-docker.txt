@@ -1,0 +1,8 @@
+# Rebuild the Docker image
+docker build -t ai-service:latest .
+
+# Run with Swagger enabled
+docker run -p 8001:8001 -e ANTHROPIC_API_KEY=your-key ai-service
+
+# Access Swagger
+# http://localhost:8001/docs

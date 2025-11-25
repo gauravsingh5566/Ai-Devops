@@ -1,0 +1,70 @@
+version: '3.8'
+
+services:
+  mcp-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mcp-service
+    ports:
+      - "8003:8003"
+    environment:
+      # Service configuration
+      - SERVICE_NAME=mcp-service
+      - SERVICE_PORT=8003
+      - DEBUG=false
+      
+      # AWS Configuration (optional - for future AWS API integration)
+      - AWS_REGION=us-east-1
+      # - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      # - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      
+      # Validation Settings
+      - DEFAULT_VALIDATION_LEVEL=standard
+      - MAX_COST_THRESHOLD=1000.0
+      
+      # Security Settings
+      - ENFORCE_ENCRYPTION=true
+      - ALLOW_PUBLIC_ACCESS=false
+      - MIN_SECURITY_SCORE=70
+      
+      # Quota Settings
+      - QUOTA_WARNING_THRESHOLD=0.8
+      
+      # Other microservices URLs
+      - AI_SERVICE_URL=http://ai-service:8001
+      - RAG_SERVICE_URL=http://rag-service:8002
+      - INFRA_SERVICE_URL=http://infra-service:8004
+      
+      # Logging
+      - LOG_LEVEL=INFO
+      - LOG_FORMAT=json
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    
+    # Restart policy
+    restart: unless-stopped
+    
+    # Network
+    networks:
+      - ai-devops-network
+
+networks:
+  ai-devops-network:
+    driver: bridge
