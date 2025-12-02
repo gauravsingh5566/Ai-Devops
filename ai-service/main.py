@@ -10,7 +10,12 @@ from pydantic import BaseModel, Field
 from typing import Dict, List, Optional
 import anthropic
 import os
+import logging
 from datetime import datetime
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Custom OpenAPI schema for better Swagger documentation
 def custom_openapi():
@@ -559,17 +564,33 @@ Return only valid JSON, no markdown or explanation."""
         # Extract JSON from response
         response_text = message.content[0].text.strip()
         
+        logger.info(f"Raw intent parse response (first 200 chars): {response_text[:200]}")
+        
         # Remove markdown code blocks if present
         if response_text.startswith("```"):
-            response_text = response_text.split("```")[1]
-            if response_text.startswith("json"):
-                response_text = response_text[4:]
+            parts = response_text.split("```")
+            if len(parts) >= 3:
+                response_text = parts[1]
+                if response_text.lower().startswith("json"):
+                    response_text = response_text[4:]
+        
+        # Find JSON boundaries
+        json_start = response_text.find("{")
+        json_end = response_text.rfind("}") + 1
+        
+        if json_start >= 0 and json_end > json_start:
+            response_text = response_text[json_start:json_end]
         
         response_text = response_text.strip()
         
         # Parse JSON
         import json
-        intent_data = json.loads(response_text)
+        try:
+            intent_data = json.loads(response_text)
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON parse error: {str(e)}")
+            logger.error(f"Problematic JSON (first 500 chars): {response_text[:500]}")
+            raise ValueError(f"Failed to parse Claude response as JSON: {str(e)}")
         
         return IntentResponse(**intent_data)
         
@@ -688,17 +709,36 @@ Make the code production-ready, secure, and well-documented. Return only valid J
         
         response_text = message.content[0].text.strip()
         
+        # Log the raw response for debugging
+        logger.info(f"Raw Claude response (first 200 chars): {response_text[:200]}")
+        
         # Clean up markdown if present
         if response_text.startswith("```"):
-            response_text = response_text.split("```")[1]
-            if response_text.startswith("json"):
-                response_text = response_text[4:]
+            # Find the closing ```
+            parts = response_text.split("```")
+            if len(parts) >= 3:
+                response_text = parts[1]
+                # Remove language identifier
+                if response_text.lower().startswith("json"):
+                    response_text = response_text[4:]
+        
+        # Find JSON boundaries
+        json_start = response_text.find("{")
+        json_end = response_text.rfind("}") + 1
+        
+        if json_start >= 0 and json_end > json_start:
+            response_text = response_text[json_start:json_end]
         
         response_text = response_text.strip()
         
         # Parse JSON response
         import json
-        code_data = json.loads(response_text)
+        try:
+            code_data = json.loads(response_text)
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON parse error: {str(e)}")
+            logger.error(f"Problematic JSON (first 500 chars): {response_text[:500]}")
+            raise ValueError(f"Failed to parse Claude response as JSON: {str(e)}")
         
         return CodeGenerationResponse(**code_data)
         

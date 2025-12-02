@@ -93,26 +93,64 @@ def parse_json_response(text: str) -> Dict[str, Any]:
         # Remove markdown code blocks
         text = text.strip()
         
-        # Pattern 1: ```json ... ```
+        # Pattern 1: ```json ... ``` or ```JSON ... ```
         if text.startswith("```"):
-            # Split by ``` and get the content between first and second ```
-            parts = text.split("```")
-            if len(parts) >= 3:
-                text = parts[1]
+            # Find the first and last ``` markers
+            first_marker = text.find("```")
+            second_marker = text.find("```", first_marker + 3)
+            
+            if second_marker != -1:
+                # Extract content between markers
+                content = text[first_marker + 3:second_marker].strip()
+                
                 # Remove language identifier if present
-                if text.startswith("json"):
-                    text = text[4:]
-                elif text.startswith("JSON"):
-                    text = text[4:]
+                if content.lower().startswith("json"):
+                    content = content[4:].strip()
+                
+                text = content
+        
+        # Pattern 2: Remove any leading/trailing text that's not JSON
+        # Find the first { or [
+        json_start = -1
+        for i, char in enumerate(text):
+            if char in ['{', '[']:
+                json_start = i
+                break
+        
+        if json_start > 0:
+            text = text[json_start:]
+        
+        # Find the last } or ]
+        json_end = -1
+        for i in range(len(text) - 1, -1, -1):
+            if text[i] in ['}', ']']:
+                json_end = i + 1
+                break
+        
+        if json_end > 0:
+            text = text[:json_end]
         
         text = text.strip()
         
         # Try to parse
-        return json.loads(text)
+        parsed = json.loads(text)
+        logger.info("Successfully parsed JSON response")
+        return parsed
         
     except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse JSON: {str(e)}\nText: {text}")
-        raise ValueError(f"Invalid JSON response from Claude: {str(e)}")
+        logger.error(f"Failed to parse JSON: {str(e)}")
+        logger.error(f"Problematic text (first 500 chars): {text[:500]}")
+        
+        # Try to provide more helpful error message
+        error_msg = f"Invalid JSON response from Claude: {str(e)}"
+        
+        # Check for common issues
+        if "Unterminated string" in str(e):
+            error_msg += " - Response contains unescaped quotes or newlines in strings"
+        elif "Expecting" in str(e):
+            error_msg += " - Response has incorrect JSON structure"
+        
+        raise ValueError(error_msg)
 
 
 def extract_terraform_code(text: str) -> str:

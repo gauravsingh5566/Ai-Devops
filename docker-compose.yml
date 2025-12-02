@@ -1,0 +1,149 @@
+version: '3.8'
+
+# AI DevOps Assistant - Complete Stack with Frontend
+# 5 services: Frontend + 4 Backend Services + Qdrant
+
+services:
+  # Vector Database
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant-data:/qdrant/storage
+    environment:
+      - QDRANT__SERVICE__GRPC_PORT=6334
+    networks:
+      - ai-devops-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Service 1: AI Service (Natural Language Processing & Code Generation)
+  ai-service:
+    build: ./ai-service
+    container_name: ai-service
+    ports:
+      - "8001:8001"
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - CLAUDE_MODEL=claude-sonnet-4-20250514
+      - RAG_SERVICE_URL=http://rag-service:8002
+      - MCP_SERVICE_URL=http://mcp-service:8003
+      - INFRA_SERVICE_URL=http://infra-service:8004
+    networks:
+      - ai-devops-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    depends_on:
+      - rag-service
+      - mcp-service
+
+  # Service 2: RAG Service (Vector Search & Knowledge Retrieval)
+  rag-service:
+    build: ./rag-service
+    container_name: rag-service
+    ports:
+      - "8002:8002"
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - AI_SERVICE_URL=http://ai-service:8001
+    networks:
+      - ai-devops-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    depends_on:
+      - qdrant
+
+  # Service 3: MCP Service (Validation & Analysis)
+  mcp-service:
+    build: ./mcp-service
+    container_name: mcp-service
+    ports:
+      - "8003:8003"
+    environment:
+      - AI_SERVICE_URL=http://ai-service:8001
+      - RAG_SERVICE_URL=http://rag-service:8002
+    networks:
+      - ai-devops-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Service 4: Infrastructure Service (Terraform Deployment)
+  infra-service:
+    build: ./infra-service
+    container_name: infra-service
+    ports:
+      - "8004:8004"
+    environment:
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AI_SERVICE_URL=http://ai-service:8001
+      - MCP_SERVICE_URL=http://mcp-service:8003
+    volumes:
+      - infra-workspaces:/app/workspaces
+    networks:
+      - ai-devops-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8004/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    depends_on:
+      - mcp-service
+
+  # Frontend: Streamlit Web Interface
+  frontend:
+    build: ./frontend
+    container_name: ai-devops-frontend
+    ports:
+      - "8501:8501"
+    environment:
+      - AI_SERVICE_URL=http://ai-service:8001
+      - RAG_SERVICE_URL=http://rag-service:8002
+      - MCP_SERVICE_URL=http://mcp-service:8003
+      - INFRA_SERVICE_URL=http://infra-service:8004
+    networks:
+      - ai-devops-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    depends_on:
+      - ai-service
+      - rag-service
+      - mcp-service
+      - infra-service
+
+volumes:
+  qdrant-data:
+    driver: local
+  infra-workspaces:
+    driver: local
+
+networks:
+  ai-devops-network:
+    driver: bridge

@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     DEBUG: bool = False
     
     # Claude AI Configuration
-    ANTHROPIC_API_KEY: str = ""
+    ANTHROPIC_API_KEY: str = "your-api-key-here"
     CLAUDE_MODEL: str = "claude-sonnet-4-20250514"
     MAX_TOKENS: int = 4000
     
@@ -97,6 +97,14 @@ Return a JSON object with this structure:
     "resources_created": ["list of AWS resources"],
     "estimated_cost_info": "rough monthly cost estimate and key cost drivers"
 }}
+
+IMPORTANT JSON FORMATTING RULES:
+- Return ONLY valid JSON, nothing else
+- Do NOT include any text before or after the JSON
+- Escape all special characters in strings (quotes, newlines, backslashes)
+- Use \\n for newlines in the terraform_code string
+- Ensure all strings are properly quoted and escaped
+- Do not use backticks around the JSON
 
 Make the code production-ready, secure, and well-documented. Return only valid JSON."""
 
