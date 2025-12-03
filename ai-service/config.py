@@ -90,9 +90,15 @@ Generate Terraform code following these guidelines:
 6. Use variables for reusable values
 7. Follow AWS Well-Architected Framework
 
+IMPORTANT - Provider Configuration:
+- DO NOT include terraform {} or required_providers blocks
+- DO NOT include provider "aws" {} blocks
+- ONLY include resource, data, variable, output, and locals blocks
+- The provider configuration will be added separately
+
 Return a JSON object with this structure:
 {{
-    "terraform_code": "complete Terraform code here",
+    "terraform_code": "complete Terraform code here (resources only, no provider blocks)",
     "explanation": "brief explanation of what this creates",
     "resources_created": ["list of AWS resources"],
     "estimated_cost_info": "rough monthly cost estimate and key cost drivers"

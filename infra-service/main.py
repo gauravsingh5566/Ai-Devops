@@ -13,9 +13,14 @@ import os
 import json
 import hashlib
 import shutil
+import logging
 from datetime import datetime
 from pathlib import Path
 import uuid
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Custom OpenAPI schema for Swagger documentation
 def custom_openapi():
@@ -263,23 +268,51 @@ def run_terraform_command(workspace_path: Path, command: List[str], env: Dict = 
         if env:
             terraform_env.update(env)
         
+        # Log the command for debugging
+        logger.info(f"Running command in {workspace_path}: {' '.join(command)}")
+        logger.info(f"Environment variables: AWS_REGION={terraform_env.get('AWS_REGION', 'not set')}")
+        
+        # Check if workspace exists
+        if not workspace_path.exists():
+            error_msg = f"Workspace path does not exist: {workspace_path}"
+            logger.error(error_msg)
+            return False, "", error_msg
+        
+        # Check if Terraform files exist
+        main_tf = workspace_path / "main.tf"
+        if not main_tf.exists():
+            error_msg = f"main.tf not found in {workspace_path}"
+            logger.error(error_msg)
+            return False, "", error_msg
+        
         # Run command
         result = subprocess.run(
             command,
             cwd=workspace_path,
             capture_output=True,
             text=True,
-            timeout=300,  # 5 minute timeout
+            timeout=600,  # 10 minute timeout
             env=terraform_env
         )
+        
+        # Log output
+        logger.info(f"Command exit code: {result.returncode}")
+        if result.stdout:
+            logger.info(f"Command stdout: {result.stdout[:500]}")
+        if result.stderr:
+            logger.warning(f"Command stderr: {result.stderr[:500]}")
         
         success = result.returncode == 0
         return success, result.stdout, result.stderr
         
     except subprocess.TimeoutExpired:
-        return False, "", "Command timed out after 5 minutes"
+        error_msg = "Command timed out after 10 minutes"
+        logger.error(error_msg)
+        return False, "", error_msg
     except Exception as e:
-        return False, "", str(e)
+        error_msg = f"Exception running Terraform: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        return False, "", error_msg
 
 
 def create_terraform_files(workspace_path: Path, terraform_code: str, region: str):
@@ -288,9 +321,20 @@ def create_terraform_files(workspace_path: Path, terraform_code: str, region: st
     main_tf = workspace_path / "main.tf"
     main_tf.write_text(terraform_code)
     
-    # Create provider.tf
-    provider_tf = workspace_path / "provider.tf"
-    provider_content = f'''terraform {{
+    logger.info(f"Created main.tf in {workspace_path}")
+    
+    # Check if terraform_code already contains provider configuration
+    has_terraform_block = 'terraform {' in terraform_code or 'terraform{' in terraform_code
+    has_provider_block = 'provider "aws"' in terraform_code or "provider 'aws'" in terraform_code
+    has_required_providers = 'required_providers' in terraform_code
+    
+    logger.info(f"Code analysis: terraform_block={has_terraform_block}, provider_block={has_provider_block}, required_providers={has_required_providers}")
+    
+    # Only create provider.tf if the code doesn't already have provider configuration
+    if not (has_terraform_block and has_required_providers):
+        logger.info("Creating provider.tf (code doesn't have complete provider configuration)")
+        provider_tf = workspace_path / "provider.tf"
+        provider_content = f'''terraform {{
   required_version = ">= 1.0"
   
   required_providers {{
@@ -305,11 +349,24 @@ provider "aws" {{
   region = "{region}"
 }}
 '''
-    provider_tf.write_text(provider_content)
+        provider_tf.write_text(provider_content)
+    else:
+        logger.info("Skipping provider.tf creation (code already has provider configuration)")
+        # If code has terraform block but no provider block, just add the provider
+        if has_terraform_block and not has_provider_block:
+            logger.info("Adding minimal provider.tf (only provider block)")
+            provider_tf = workspace_path / "provider.tf"
+            provider_content = f'''provider "aws" {{
+  region = "{region}"
+}}
+'''
+            provider_tf.write_text(provider_content)
     
     # Create terraform.tfvars (if needed)
     tfvars = workspace_path / "terraform.tfvars"
     tfvars.write_text(f'# Deployment variables\nregion = "{region}"\n')
+    
+    logger.info("Terraform files created successfully")
 
 
 def parse_terraform_plan(plan_output: str) -> Dict[str, int]:

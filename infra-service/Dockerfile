@@ -6,13 +6,22 @@ FROM python:3.11-slim
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies and Terraform
+# Install system dependencies, Terraform, and AWS CLI
 RUN apt-get update && apt-get install -y \
     curl \
     unzip \
     git \
     wget \
+    groff \
+    less \
     && rm -rf /var/lib/apt/lists/*
+
+# Install AWS CLI v2
+RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" && \
+    unzip awscliv2.zip && \
+    ./aws/install && \
+    rm -rf awscliv2.zip aws && \
+    aws --version
 
 # Install Terraform
 ARG TERRAFORM_VERSION=1.6.6
@@ -31,8 +40,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
-# Create workspace directory
-RUN mkdir -p /app/workspaces
+# Create workspace directory with proper permissions
+RUN mkdir -p /app/workspaces && chmod 755 /app/workspaces
 
 # Create non-root user
 RUN useradd -m -u 1000 infraservice && \
