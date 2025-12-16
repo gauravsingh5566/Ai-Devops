@@ -12,10 +12,114 @@ import anthropic
 import os
 import logging
 from datetime import datetime
+import json
+import re
+import httpx
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def extract_json_from_text(text: str) -> dict:
+    """
+    Robustly extract and parse JSON from Claude's response.
+    Handles markdown code blocks, extra text, and formatting issues.
+    """
+    original_text = text
+    
+    try:
+        # Method 1: Try direct parsing first
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    
+    # Method 2: Remove markdown code blocks
+    if "```" in text:
+        # Extract content between code fences
+        pattern = r"```(?:json)?\s*(\{.*?\})\s*```"
+        match = re.search(pattern, text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(1))
+            except json.JSONDecodeError:
+                text = match.group(1)
+        else:
+            # Try removing all backticks
+            text = text.replace("```json", "").replace("```", "")
+    
+    # Method 3: Find JSON object boundaries
+    json_start = text.find("{")
+    json_end = text.rfind("}") + 1
+    
+    if json_start >= 0 and json_end > json_start:
+        text = text[json_start:json_end]
+    
+    # Method 4: Try parsing the extracted text
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    
+    # Method 5: Fix common JSON issues
+    # Replace smart quotes
+    text = text.replace(""", '"').replace(""", '"')
+    text = text.replace("'", "'").replace("'", "'")
+    
+    # Try parsing again
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON parsing failed after all attempts")
+        logger.error(f"Original text (first 500 chars): {original_text[:500]}")
+        logger.error(f"Processed text (first 500 chars): {text[:500]}")
+        logger.error(f"Error: {str(e)}")
+        raise ValueError(f"Failed to parse Claude response as JSON: {str(e)}")
+
+
+def validate_terraform_syntax(terraform_code: str) -> dict:
+    """
+    Validate Terraform code for common syntax errors before deployment.
+    Returns dict with 'valid' bool and 'errors' list.
+    """
+    errors = []
+    
+    # Common invalid attributes that Claude sometimes generates
+    invalid_patterns = [
+        (r'name_description\s*=', 'name_description', 'Use "description" instead'),
+        (r'subnet_type\s*=', 'subnet_type', 'Use tags = { Type = "..." } instead'),
+        (r'instance_name\s*=', 'instance_name', 'Use tags = { Name = "..." } instead'),
+        (r'vpc_name\s*=', 'vpc_name', 'Use tags = { Name = "..." } instead'),
+    ]
+    
+    for pattern, attr_name, suggestion in invalid_patterns:
+        if re.search(pattern, terraform_code):
+            errors.append({
+                'attribute': attr_name,
+                'message': f'Invalid attribute "{attr_name}" found',
+                'suggestion': suggestion,
+                'severity': 'error'
+            })
+    
+    # Check for common security group issues
+    if 'aws_security_group' in terraform_code:
+        # Security groups must have 'description'
+        sg_blocks = re.findall(r'resource\s+"aws_security_group"\s+"[^"]+"\s*{([^}]+)}', terraform_code, re.DOTALL)
+        for sg_block in sg_blocks:
+            if 'description' not in sg_block:
+                errors.append({
+                    'resource': 'aws_security_group',
+                    'message': 'Security group missing required "description" attribute',
+                    'suggestion': 'Add: description = "Purpose of this security group"',
+                    'severity': 'error'
+                })
+    
+    return {
+        'valid': len([e for e in errors if e['severity'] == 'error']) == 0,
+        'errors': errors,
+        'warnings': [e for e in errors if e['severity'] == 'warning'],
+        'critical_errors': [e for e in errors if e['severity'] == 'error']
+    }
 
 # Custom OpenAPI schema for better Swagger documentation
 def custom_openapi():
@@ -533,6 +637,34 @@ async def parse_intent(request: UserRequest):
     ```
     """
     try:
+        # STEP 1: Check intent cache first
+        logger.info(f"🔍 Checking intent cache for: {request.message[:50]}...")
+        
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                cache_response = await client.post(
+                    "http://rag-service:8002/intent/check-cache",
+                    json={"user_request": request.message}
+                )
+                
+                if cache_response.status_code == 200:
+                    cache_data = cache_response.json()
+                    
+                    if cache_data.get("found"):
+                        # Cache HIT! Return cached intent
+                        logger.info(
+                            f"✅ Intent cache HIT! Similarity: {cache_data.get('similarity_score')}, "
+                            f"Saved ~5 seconds and API cost!"
+                        )
+                        return IntentResponse(**cache_data["intent"])
+                    else:
+                        logger.info("❌ Intent cache MISS. Will use Claude AI.")
+        except Exception as cache_error:
+            logger.warning(f"Intent cache check failed (will use Claude): {str(cache_error)}")
+        
+        # STEP 2: Cache miss or error - use Claude AI
+        logger.info("🤖 Parsing intent with Claude AI...")
+        
         prompt = f"""You are an AWS infrastructure expert. Parse this user request into structured JSON.
 
 User Request: "{request.message}"
@@ -564,33 +696,30 @@ Return only valid JSON, no markdown or explanation."""
         # Extract JSON from response
         response_text = message.content[0].text.strip()
         
-        logger.info(f"Raw intent parse response (first 200 chars): {response_text[:200]}")
+        logger.info(f"Raw intent parse response (first 300 chars): {response_text[:300]}")
         
-        # Remove markdown code blocks if present
-        if response_text.startswith("```"):
-            parts = response_text.split("```")
-            if len(parts) >= 3:
-                response_text = parts[1]
-                if response_text.lower().startswith("json"):
-                    response_text = response_text[4:]
-        
-        # Find JSON boundaries
-        json_start = response_text.find("{")
-        json_end = response_text.rfind("}") + 1
-        
-        if json_start >= 0 and json_end > json_start:
-            response_text = response_text[json_start:json_end]
-        
-        response_text = response_text.strip()
-        
-        # Parse JSON
-        import json
+        # Use robust JSON extraction
         try:
-            intent_data = json.loads(response_text)
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON parse error: {str(e)}")
-            logger.error(f"Problematic JSON (first 500 chars): {response_text[:500]}")
+            intent_data = extract_json_from_text(response_text)
+        except ValueError as e:
+            logger.error(f"Failed to extract JSON from Claude response: {str(e)}")
             raise ValueError(f"Failed to parse Claude response as JSON: {str(e)}")
+        
+        # STEP 3: Store the parsed intent in cache for future use
+        try:
+            logger.info("💾 Storing parsed intent in cache...")
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(
+                    "http://rag-service:8002/intent/store",
+                    json={
+                        "user_request": request.message,
+                        "intent": intent_data
+                    }
+                )
+            logger.info("✅ Intent stored in cache successfully")
+        except Exception as store_error:
+            # Don't fail the request if caching fails
+            logger.warning(f"Failed to cache intent (non-critical): {str(store_error)}")
         
         return IntentResponse(**intent_data)
         
@@ -683,6 +812,31 @@ INFRASTRUCTURE REQUIREMENTS:
 {policy_text}
 
 Generate Terraform code following these guidelines:
+
+=== TERRAFORM SYNTAX RULES (CRITICAL) ===
+1. Use ONLY valid Terraform HCL syntax
+2. Use correct attribute names for each resource type
+3. Common AWS resource attributes:
+   - aws_vpc: cidr_block, enable_dns_hostnames, enable_dns_support, tags
+   - aws_subnet: vpc_id, cidr_block, availability_zone, map_public_ip_on_launch, tags
+   - aws_security_group: name, description, vpc_id, ingress, egress, tags
+   - aws_instance: ami, instance_type, subnet_id, vpc_security_group_ids, tags
+   - aws_db_instance: identifier, engine, instance_class, allocated_storage, username, password, vpc_security_group_ids, db_subnet_group_name, tags
+
+4. NEVER use invalid attributes like:
+   ❌ name_description (does not exist)
+   ❌ subnet_type (use tags instead)
+   ❌ instance_name (use tags.Name instead)
+   
+5. Security group syntax:
+   ✅ Correct: description = "Security group for EC2"
+   ❌ Wrong: name_description = "..."
+   
+6. Use tags for naming:
+   ✅ Correct: tags = {{ Name = "my-resource" }}
+   ❌ Wrong: name = "my-resource" (on resources that don't support it)
+
+=== BEST PRACTICES ===
 1. Use latest AWS provider syntax
 2. Include proper resource naming with tags
 3. Add security best practices (security groups, encryption)
@@ -691,15 +845,66 @@ Generate Terraform code following these guidelines:
 6. Use variables for reusable values
 7. Follow AWS Well-Architected Framework
 
-Return a JSON object with this structure:
+=== PROVIDER CONFIGURATION ===
+- DO NOT include terraform {{}} or required_providers blocks
+- DO NOT include provider "aws" {{}} blocks
+- ONLY include resource, data, variable, output, and locals blocks
+- The provider configuration will be added separately
+
+=== EXAMPLE CORRECT TERRAFORM ===
+```hcl
+resource "aws_vpc" "main" {{
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_hostnames = true
+  enable_dns_support   = true
+  
+  tags = {{
+    Name = "main-vpc"
+    Environment = "production"
+  }}
+}}
+
+resource "aws_security_group" "web" {{
+  name        = "web-sg"
+  description = "Security group for web servers"  # ✅ Use 'description', NOT 'name_description'
+  vpc_id      = aws_vpc.main.id
+  
+  ingress {{
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }}
+  
+  tags = {{
+    Name = "web-security-group"
+  }}
+}}
+```
+
+=== CRITICAL JSON FORMAT REQUIREMENTS ===
+- You MUST return ONLY a valid JSON object
+- Do NOT include any text before or after the JSON
+- Do NOT wrap the JSON in markdown code blocks (no ```)
+- Do NOT include any explanatory text outside the JSON
+- Properly escape all special characters in strings
+- Use \\n for newlines in the terraform_code string
+- Ensure all strings are properly quoted
+- The response must be parseable by json.loads()
+
+Return EXACTLY this JSON structure with no additional text:
 {{
-    "terraform_code": "complete Terraform code here",
+    "terraform_code": "your terraform code here with \\n for newlines",
     "explanation": "brief explanation of what this creates",
-    "resources_created": ["list of AWS resources"],
+    "resources_created": ["list", "of", "AWS", "resources"],
     "estimated_cost_info": "rough monthly cost estimate and key cost drivers"
 }}
 
-Make the code production-ready, secure, and well-documented. Return only valid JSON."""
+Remember: 
+1. Use ONLY valid Terraform attribute names
+2. Check AWS provider documentation for correct syntax
+3. Return ONLY the JSON object, nothing else
+4. No markdown, no explanations, just pure JSON"""
 
         message = claude_client.messages.create(
             model="claude-sonnet-4-20250514",
@@ -710,35 +915,36 @@ Make the code production-ready, secure, and well-documented. Return only valid J
         response_text = message.content[0].text.strip()
         
         # Log the raw response for debugging
-        logger.info(f"Raw Claude response (first 200 chars): {response_text[:200]}")
+        logger.info(f"Raw Claude response (first 300 chars): {response_text[:300]}")
         
-        # Clean up markdown if present
-        if response_text.startswith("```"):
-            # Find the closing ```
-            parts = response_text.split("```")
-            if len(parts) >= 3:
-                response_text = parts[1]
-                # Remove language identifier
-                if response_text.lower().startswith("json"):
-                    response_text = response_text[4:]
-        
-        # Find JSON boundaries
-        json_start = response_text.find("{")
-        json_end = response_text.rfind("}") + 1
-        
-        if json_start >= 0 and json_end > json_start:
-            response_text = response_text[json_start:json_end]
-        
-        response_text = response_text.strip()
-        
-        # Parse JSON response
-        import json
+        # Use robust JSON extraction
         try:
-            code_data = json.loads(response_text)
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON parse error: {str(e)}")
-            logger.error(f"Problematic JSON (first 500 chars): {response_text[:500]}")
+            code_data = extract_json_from_text(response_text)
+        except ValueError as e:
+            logger.error(f"Failed to extract JSON from Claude response: {str(e)}")
+            # Return a fallback response with error info
             raise ValueError(f"Failed to parse Claude response as JSON: {str(e)}")
+        
+        # Validate Terraform syntax
+        terraform_code = code_data.get('terraform_code', '')
+        validation_result = validate_terraform_syntax(terraform_code)
+        
+        if not validation_result['valid']:
+            logger.warning(f"Generated Terraform has syntax errors: {validation_result['critical_errors']}")
+            # Auto-fix common issues
+            fixed_code = terraform_code
+            for error in validation_result['critical_errors']:
+                if error['attribute'] == 'name_description':
+                    fixed_code = re.sub(r'name_description\s*=', 'description =', fixed_code)
+                    logger.info("Auto-fixed: name_description → description")
+            
+            code_data['terraform_code'] = fixed_code
+            # Re-validate
+            revalidation = validate_terraform_syntax(fixed_code)
+            if revalidation['valid']:
+                logger.info("✅ Auto-fix successful! Code is now valid.")
+            else:
+                logger.warning(f"⚠️ Some issues remain after auto-fix: {revalidation['critical_errors']}")
         
         return CodeGenerationResponse(**code_data)
         

@@ -132,10 +132,69 @@ qdrant_client = QdrantClient(
 
 # Default collection
 DEFAULT_COLLECTION = "aws_best_practices"
+INTENT_CACHE_COLLECTION = "cached_intents"  # New collection for intent caching
 EMBEDDING_DIMENSION = 384
+SIMILARITY_THRESHOLD = 0.85  # Threshold for using cached intent (85% similar)
 
 
 # ============== Pydantic Models ==============
+
+
+
+class IntentCacheQuery(BaseModel):
+    """Query to check cached intents"""
+    user_request: str = Field(
+        ...,
+        description="User's natural language infrastructure request",
+        example="Create a VPC with 2 public subnets"
+    )
+    similarity_threshold: Optional[float] = Field(
+        default=SIMILARITY_THRESHOLD,
+        description="Minimum similarity score to use cached intent (0.0-1.0)",
+        ge=0.0,
+        le=1.0
+    )
+
+
+class CachedIntentResult(BaseModel):
+    """Cached intent response"""
+    found: bool = Field(..., description="Whether a cached intent was found")
+    similarity_score: Optional[float] = Field(
+        None,
+        description="Similarity score of matched request"
+    )
+    user_request: Optional[str] = Field(
+        None,
+        description="Original user request that was cached"
+    )
+    intent: Optional[Dict] = Field(
+        None,
+        description="Parsed intent from cache"
+    )
+    cache_timestamp: Optional[str] = Field(
+        None,
+        description="When this intent was cached"
+    )
+
+
+class StoreIntentRequest(BaseModel):
+    """Store a new parsed intent"""
+    user_request: str = Field(
+        ...,
+        description="User's original request",
+        example="Create a VPC with 2 public subnets"
+    )
+    intent: Dict = Field(
+        ...,
+        description="Parsed intent to cache",
+        example={
+            "resources": ["vpc", "subnet"],
+            "requirements": {"subnet_count": 2, "subnet_type": "public"},
+            "estimated_complexity": "simple",
+            "needs_rag": True
+        }
+    )
+
 
 class SearchQuery(BaseModel):
     """Search query for finding relevant documents"""
@@ -919,6 +978,136 @@ async def health_check():
             total_documents=0,
             timestamp=datetime.now().isoformat()
         )
+
+
+# ============== Intent Caching Endpoints ==============
+
+@app.post(
+    "/intent/check-cache",
+    response_model=CachedIntentResult,
+    tags=["Intent Cache"],
+    summary="Check for Cached Intent",
+    description="""
+Check if a similar user request has been parsed before and retrieve the cached intent.
+
+### How it works:
+1. Converts user request to vector embedding
+2. Searches cached_intents collection in Qdrant  
+3. If similarity >= threshold (default 0.85), returns cached intent
+4. If no match, returns found: false
+
+### Benefits:
+- ⚡ Fast: ~50ms vs ~5s for Claude AI call
+- 💰 Cost: Free (no Claude API call)
+- 📊 Consistent: Same input = same output
+"""
+)
+async def check_cached_intent(query: IntentCacheQuery):
+    """Check if a similar user request exists in cache."""
+    import time
+    start_time = time.time()
+    
+    try:
+        get_or_create_collection(INTENT_CACHE_COLLECTION)
+        query_embedding = get_embedding(query.user_request)
+        
+        results = qdrant_client.search(
+            collection_name=INTENT_CACHE_COLLECTION,
+            query_vector=query_embedding,
+            limit=1,
+            with_payload=True
+        )
+        
+        if results and len(results) > 0:
+            top_result = results[0]
+            similarity = round(top_result.score, 4)
+            
+            if similarity >= query.similarity_threshold:
+                payload = top_result.payload or {}
+                search_time = (time.time() - start_time) * 1000
+                
+                logger.info(f"✅ Intent cache HIT! Similarity: {similarity}, Time: {search_time:.2f}ms")
+                
+                return CachedIntentResult(
+                    found=True,
+                    similarity_score=similarity,
+                    user_request=payload.get('user_request', ''),
+                    intent=payload.get('intent', {}),
+                    cache_timestamp=payload.get('timestamp', '')
+                )
+        
+        search_time = (time.time() - start_time) * 1000
+        logger.info(f"❌ Intent cache MISS. Time: {search_time:.2f}ms")
+        
+        return CachedIntentResult(found=False, similarity_score=None, user_request=None, intent=None, cache_timestamp=None)
+        
+    except Exception as e:
+        logger.error(f"Intent cache check failed: {str(e)}")
+        return CachedIntentResult(found=False, similarity_score=None, user_request=None, intent=None, cache_timestamp=None)
+
+
+@app.post(
+    "/intent/store",
+    tags=["Intent Cache"],
+    summary="Store Parsed Intent",
+    description="Store a newly parsed intent in the cache for future reuse"
+)
+async def store_intent(request: StoreIntentRequest):
+    """Store a parsed intent in the cache."""
+    try:
+        get_or_create_collection(INTENT_CACHE_COLLECTION)
+        request_embedding = get_embedding(request.user_request)
+        point_id = str(uuid.uuid4())
+        cache_id = f"cached_intent_{point_id[:8]}"
+        timestamp = datetime.now().isoformat()
+        
+        qdrant_client.upsert(
+            collection_name=INTENT_CACHE_COLLECTION,
+            points=[
+                PointStruct(
+                    id=point_id,
+                    vector=request_embedding,
+                    payload={
+                        "cache_id": cache_id,
+                        "user_request": request.user_request,
+                        "intent": request.intent,
+                        "timestamp": timestamp
+                    }
+                )
+            ]
+        )
+        
+        logger.info(f"✅ Stored intent in cache: {cache_id}")
+        return {"message": "Intent cached successfully", "cache_id": cache_id, "timestamp": timestamp}
+        
+    except Exception as e:
+        logger.error(f"Failed to store intent: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to store intent in cache: {str(e)}")
+
+
+@app.get(
+    "/intent/stats",
+    tags=["Intent Cache"],
+    summary="Cache Statistics",
+    description="Get statistics about the intent cache"
+)
+async def get_cache_stats():
+    """Get statistics about cached intents"""
+    try:
+        try:
+            coll_info = qdrant_client.get_collection(INTENT_CACHE_COLLECTION)
+            cache_count = coll_info.points_count
+        except:
+            cache_count = 0
+        
+        return {
+            "cache_collection": INTENT_CACHE_COLLECTION,
+            "total_cached_intents": cache_count,
+            "similarity_threshold": SIMILARITY_THRESHOLD,
+            "status": "active" if cache_count > 0 else "empty"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get cache stats: {str(e)}")
 
 
 @app.get(

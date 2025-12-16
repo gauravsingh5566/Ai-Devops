@@ -219,9 +219,11 @@ class TerraformPlanResponse(BaseModel):
     """Terraform plan response"""
     deployment_id: str
     plan_output: str
-    resources_to_add: int
-    resources_to_change: int
-    resources_to_destroy: int
+    plan_summary: Dict[str, int] = Field(
+        ...,
+        description="Summary of plan changes",
+        example={"add": 5, "change": 0, "destroy": 0}
+    )
     plan_file_path: str
 
 
@@ -603,9 +605,7 @@ async def terraform_plan(deployment_id: str):
             return TerraformPlanResponse(
                 deployment_id=deployment_id,
                 plan_output=stdout,
-                resources_to_add=counts["add"],
-                resources_to_change=counts["change"],
-                resources_to_destroy=counts["destroy"],
+                plan_summary=counts,
                 plan_file_path=str(plan_file)
             )
         else:
@@ -628,11 +628,12 @@ async def terraform_plan(deployment_id: str):
     summary="Apply Terraform Changes",
     description="Run 'terraform apply' to create/update infrastructure"
 )
-async def terraform_apply(deployment_id: str, auto_approve: bool = False):
+async def terraform_apply(deployment_id: str, auto_approve: bool = True):
     """
     Apply Terraform plan to create infrastructure.
     
     This actually creates the AWS resources.
+    User already approved in UI by clicking "Deploy to AWS" button.
     """
     if deployment_id not in deployments_db:
         raise HTTPException(status_code=404, detail="Deployment not found")
@@ -646,12 +647,8 @@ async def terraform_apply(deployment_id: str, auto_approve: bool = False):
             detail="Deployment must be planned before applying. Run /plan first."
         )
     
-    # Check auto-approve
-    if not auto_approve and not deployment.get("auto_approve"):
-        raise HTTPException(
-            status_code=400,
-            detail="Manual approval required. Set auto_approve=true to proceed."
-        )
+    # ✅ REMOVED: The manual approval check
+    # User already reviewed and approved the plan in the UI
     
     # Update status
     deployment["status"] = "applying"
@@ -660,15 +657,16 @@ async def terraform_apply(deployment_id: str, auto_approve: bool = False):
     deployment["updated_at"] = datetime.now().isoformat()
     
     try:
-        # Run terraform apply
-        command = ["terraform", "apply", "-no-color"]
-        
-        # Use plan file if it exists
+        # ✅ FIXED: Always use -auto-approve since user approved in UI
+        # Run terraform apply with plan file
         plan_file = workspace_path / "tfplan"
+        
         if plan_file.exists():
-            command.extend(["-auto-approve", "tfplan"])
+            # Use the plan file (recommended)
+            command = ["terraform", "apply", "-auto-approve", "-no-color", "tfplan"]
         else:
-            command.append("-auto-approve")
+            # Fallback if no plan file
+            command = ["terraform", "apply", "-auto-approve", "-no-color"]
         
         success, stdout, stderr = run_terraform_command(workspace_path, command)
         

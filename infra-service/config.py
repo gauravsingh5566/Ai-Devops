@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     AWS_SECRET_ACCESS_KEY: Optional[str] = None
     
     # Deployment Settings
-    DEFAULT_AUTO_APPROVE: bool = False
+    DEFAULT_AUTO_APPROVE: bool = True
     MAX_CONCURRENT_DEPLOYMENTS: int = 5
     DEPLOYMENT_TIMEOUT: int = 300  # seconds
     

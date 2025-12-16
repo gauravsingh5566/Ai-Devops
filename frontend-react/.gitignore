@@ -1,0 +1,54 @@
+# Dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Build output
+build/
+dist/
+.out/
+.next/
+.cache/
+.tmp/
+
+# Local environment
+.env
+.env.*.local
+*.local
+
+# Logs
+logs
+*.log
+*.log.*
+log-*.txt
+
+# OS / Editor junk
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Coverage / tests
+coverage/
+jest-coverage/
+.nyc_output/
+
+# Misc
+*.tgz
+*.gz
+*.zip
+
+# Storybook
+.storybook-out/
+storybook-static/
+
+# ESLint / TypeScript caches
+.eslintcache
+tsconfig.tsbuildinfo
