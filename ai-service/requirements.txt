@@ -5,8 +5,8 @@
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 
-# Claude AI SDK
-anthropic==0.34.2
+# Google Gemini AI SDK (FREE API)
+google-generativeai==0.3.2
 
 # Data validation
 pydantic==2.5.0

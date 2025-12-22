@@ -1,26 +1,24 @@
 """
 Utility functions for AI Service
-Handles Claude API interactions, JSON parsing, and helper functions
+Handles Gemini API interactions, JSON parsing, and helper functions
 """
 
 import json
 import re
 from typing import Dict, Any, Optional
-import anthropic
+import google.generativeai as genai
 from config import settings
 import logging
 
 logger = logging.getLogger(__name__)
 
 
-class ClaudeAPIHandler:
-    """Handler for Claude AI API interactions"""
+class GeminiAPIHandler:
+    """Handler for Google Gemini API interactions"""
     
     def __init__(self):
-        self.client = anthropic.Anthropic(
-            api_key=settings.ANTHROPIC_API_KEY
-        )
-        self.model = settings.CLAUDE_MODEL
+        genai.configure(api_key=settings.GEMINI_API_KEY)
+        self.model = genai.GenerativeModel(settings.GEMINI_MODEL)
         self.max_tokens = settings.MAX_TOKENS
     
     async def send_message(
@@ -29,33 +27,26 @@ class ClaudeAPIHandler:
         max_tokens: Optional[int] = None
     ) -> str:
         """
-        Send a message to Claude and get response
+        Send a message to Gemini and get response
         
         Args:
             prompt: The prompt to send
-            max_tokens: Override default max tokens
+            max_tokens: Override default max tokens (not used in Gemini)
             
         Returns:
-            Response text from Claude
+            Response text from Gemini
         """
         try:
-            message = self.client.messages.create(
-                model=self.model,
-                max_tokens=max_tokens or self.max_tokens,
-                messages=[{"role": "user", "content": prompt}]
-            )
+            response = self.model.generate_content(prompt)
+            response_text = response.text
             
-            response_text = message.content[0].text
-            logger.info(f"Claude API response received, length: {len(response_text)}")
+            logger.info(f"Gemini API response received, length: {len(response_text)}")
             
             return response_text
             
-        except anthropic.APIError as e:
-            logger.error(f"Claude API error: {str(e)}")
-            raise Exception(f"Claude API error: {str(e)}")
         except Exception as e:
-            logger.error(f"Unexpected error calling Claude: {str(e)}")
-            raise Exception(f"Failed to communicate with Claude: {str(e)}")
+            logger.error(f"Gemini API error: {str(e)}")
+            raise Exception(f"Gemini API error: {str(e)}")
     
     async def send_message_json(
         self, 
@@ -78,10 +69,10 @@ class ClaudeAPIHandler:
 
 def parse_json_response(text: str) -> Dict[str, Any]:
     """
-    Parse JSON from Claude's response, handling markdown code blocks
+    Parse JSON from Gemini's response, handling markdown code blocks
     
     Args:
-        text: Raw response text from Claude
+        text: Raw response text from Gemini
         
     Returns:
         Parsed JSON object
@@ -142,7 +133,7 @@ def parse_json_response(text: str) -> Dict[str, Any]:
         logger.error(f"Problematic text (first 500 chars): {text[:500]}")
         
         # Try to provide more helpful error message
-        error_msg = f"Invalid JSON response from Claude: {str(e)}"
+        error_msg = f"Invalid JSON response from Gemini: {str(e)}"
         
         # Check for common issues
         if "Unterminated string" in str(e):

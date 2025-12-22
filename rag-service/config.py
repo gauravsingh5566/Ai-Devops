@@ -15,16 +15,15 @@ class Settings(BaseSettings):
     SERVICE_PORT: int = 8002
     DEBUG: bool = False
     
-    # Claude AI Configuration
-    ANTHROPIC_API_KEY: str = "your-api-key-here"
-    CLAUDE_MODEL: str = "claude-sonnet-4-20250514"
+    # Local Embedding Model (NO API CALLS - 100% FREE)
+    EMBEDDING_MODEL: str = "all-MiniLM-L6-v2"
     
     # Qdrant Configuration
     QDRANT_HOST: str = "localhost"
     QDRANT_PORT: int = 6333
     QDRANT_COLLECTION_NAME: str = "aws_best_practices"
     
-    # Embedding Configuration
+    # Embedding Configuration (Local model uses 384 dimensions)
     EMBEDDING_DIMENSION: int = 384
     
     # Search Configuration

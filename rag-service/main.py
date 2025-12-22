@@ -1,109 +1,30 @@
 """
-RAG Service - Vector Search & Knowledge Retrieval
-Handles document storage, embedding generation, and semantic search for AWS best practices
+RAG Service - Local Embeddings
+Retrieval-Augmented Generation using Sentence Transformers (LOCAL - NO API CALLS)
 """
 
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel, Field
-from typing import Dict, List, Optional
-import anthropic
+from typing import List, Optional, Dict, Any
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue
+from qdrant_client.models import Distance, VectorParams, PointStruct
+from sentence_transformers import SentenceTransformer
 import os
-import json
-import hashlib
+import logging
 from datetime import datetime
-import uuid
+import hashlib
 
-# Custom OpenAPI schema for Swagger documentation
-def custom_openapi():
-    if app.openapi_schema:
-        return app.openapi_schema
-    
-    openapi_schema = get_openapi(
-        title="📚 RAG Service - Knowledge Base",
-        version="1.0.0",
-        description="""
-## Vector Search & Knowledge Retrieval Service
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-This service manages the knowledge base for AWS best practices, Terraform templates, 
-and organizational policies using **Qdrant** vector database and **Claude AI** for embeddings.
-
-### 🎯 Key Features
-
-- **Document Ingestion**: Add AWS documentation, templates, and policies
-- **Semantic Search**: Find relevant best practices using natural language
-- **Context Retrieval**: Get relevant context for code generation
-- **Knowledge Management**: Organize and update the knowledge base
-
-### 🔄 How It Works
-
-1. Documents are chunked and embedded using Claude AI
-2. Embeddings stored in Qdrant vector database
-3. Queries are embedded and matched against stored documents
-4. Most relevant documents returned with similarity scores
-
-### 📚 Knowledge Categories
-
-- AWS Best Practices
-- Terraform Templates
-- Security Policies
-- Cost Optimization Tips
-- Organization Standards
-
-### 🔗 Integration
-
-Used by AI Service to retrieve context for code generation:
-```
-User Request → AI Service → RAG Service → Best Practices → Code Generation
-```
-        """,
-        routes=app.routes,
-        tags=[
-            {
-                "name": "Search",
-                "description": "Semantic search across the knowledge base"
-            },
-            {
-                "name": "Documents",
-                "description": "Add, update, and manage documents in the knowledge base"
-            },
-            {
-                "name": "Collections",
-                "description": "Manage document collections and categories"
-            },
-            {
-                "name": "Health & Status",
-                "description": "Service health checks and statistics"
-            }
-        ]
-    )
-    
-    openapi_schema["info"]["contact"] = {
-        "name": "AI DevOps Assistant",
-        "email": "support@example.com"
-    }
-    
-    openapi_schema["info"]["license"] = {
-        "name": "MIT",
-        "url": "https://opensource.org/licenses/MIT"
-    }
-    
-    app.openapi_schema = openapi_schema
-    return app.openapi_schema
-
-
+# Initialize FastAPI
 app = FastAPI(
-    title="RAG Service",
-    version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
-    openapi_url="/openapi.json"
+    title="RAG Service - Local Embeddings",
+    version="3.0.0",
+    description="Vector search using Local Sentence Transformers (100% FREE - No API calls)"
 )
-
-app.openapi = custom_openapi
 
 # CORS middleware
 app.add_middleware(
@@ -114,1040 +35,260 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize Claude client for embeddings
-claude_client = anthropic.Anthropic(
-    api_key=os.environ.get("ANTHROPIC_API_KEY", "your-api-key-here")
-)
+# Configuration
+QDRANT_HOST = os.getenv("QDRANT_HOST", "qdrant")
+QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
 
-# Initialize Qdrant client
-QDRANT_HOST = os.environ.get("QDRANT_HOST", "localhost")
-QDRANT_PORT = int(os.environ.get("QDRANT_PORT", "6333"))
+# Collection names
+BEST_PRACTICES_COLLECTION = "aws_best_practices"
+INTENT_CACHE_COLLECTION = "cached_intents"
 
-# Use in-memory storage for development, or connect to Qdrant server
-qdrant_client = QdrantClient(
-    host=QDRANT_HOST,
-    port=QDRANT_PORT,
-    timeout=30
-)
-
-# Default collection
-DEFAULT_COLLECTION = "aws_best_practices"
-INTENT_CACHE_COLLECTION = "cached_intents"  # New collection for intent caching
+# Local embedding model (384 dimensions, runs locally - NO API calls!)
+EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 EMBEDDING_DIMENSION = 384
-SIMILARITY_THRESHOLD = 0.85  # Threshold for using cached intent (85% similar)
+SIMILARITY_THRESHOLD = 0.85
+
+# Initialize Qdrant
+try:
+    qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+    logger.info(f"Connected to Qdrant at {QDRANT_HOST}:{QDRANT_PORT}")
+except Exception as e:
+    logger.error(f"Failed to connect to Qdrant: {e}")
+    qdrant_client = None
+
+# Initialize local embedding model
+logger.info(f"Loading local embedding model: {EMBEDDING_MODEL_NAME}...")
+try:
+    embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    logger.info(f"✅ Embedding model loaded! (384D, LOCAL, NO API CALLS)")
+except Exception as e:
+    logger.error(f"Failed to load embedding model: {e}")
+    embedding_model = None
 
 
 # ============== Pydantic Models ==============
 
-
-
-class IntentCacheQuery(BaseModel):
-    """Query to check cached intents"""
-    user_request: str = Field(
-        ...,
-        description="User's natural language infrastructure request",
-        example="Create a VPC with 2 public subnets"
-    )
-    similarity_threshold: Optional[float] = Field(
-        default=SIMILARITY_THRESHOLD,
-        description="Minimum similarity score to use cached intent (0.0-1.0)",
-        ge=0.0,
-        le=1.0
-    )
-
-
-class CachedIntentResult(BaseModel):
-    """Cached intent response"""
-    found: bool = Field(..., description="Whether a cached intent was found")
-    similarity_score: Optional[float] = Field(
-        None,
-        description="Similarity score of matched request"
-    )
-    user_request: Optional[str] = Field(
-        None,
-        description="Original user request that was cached"
-    )
-    intent: Optional[Dict] = Field(
-        None,
-        description="Parsed intent from cache"
-    )
-    cache_timestamp: Optional[str] = Field(
-        None,
-        description="When this intent was cached"
-    )
-
-
-class StoreIntentRequest(BaseModel):
-    """Store a new parsed intent"""
-    user_request: str = Field(
-        ...,
-        description="User's original request",
-        example="Create a VPC with 2 public subnets"
-    )
-    intent: Dict = Field(
-        ...,
-        description="Parsed intent to cache",
-        example={
-            "resources": ["vpc", "subnet"],
-            "requirements": {"subnet_count": 2, "subnet_type": "public"},
-            "estimated_complexity": "simple",
-            "needs_rag": True
-        }
-    )
-
-
-class SearchQuery(BaseModel):
-    """Search query for finding relevant documents"""
-    query: str = Field(
-        ...,
-        description="Natural language search query",
-        example="VPC best practices for production",
-        min_length=3,
-        max_length=500
-    )
-    collection: Optional[str] = Field(
-        default=DEFAULT_COLLECTION,
-        description="Collection to search in",
-        example="aws_best_practices"
-    )
-    n_results: Optional[int] = Field(
-        default=5,
-        description="Number of results to return",
-        ge=1,
-        le=20
-    )
-    filter_metadata: Optional[Dict] = Field(
-        default=None,
-        description="Metadata filters to apply",
-        example={"category": "networking", "provider": "aws"}
-    )
-
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "query": "How to set up a highly available VPC with private subnets",
-                "collection": "aws_best_practices",
-                "n_results": 5,
-                "filter_metadata": {"category": "networking"}
-            }
-        }
-
+class SearchRequest(BaseModel):
+    query: str = Field(..., description="Search query")
+    limit: int = Field(default=5, ge=1, le=20, description="Number of results")
 
 class SearchResult(BaseModel):
-    """Individual search result"""
-    id: str = Field(..., description="Document ID")
-    content: str = Field(..., description="Document content")
-    metadata: Dict = Field(..., description="Document metadata")
-    score: float = Field(..., description="Similarity score (0-1)")
-
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "id": "doc_vpc_001",
-                "content": "VPC Best Practice: Use /16 CIDR block for production VPCs to allow room for growth. Deploy resources across multiple AZs for high availability.",
-                "metadata": {
-                    "source": "AWS Well-Architected Framework",
-                    "category": "networking",
-                    "last_updated": "2024-01-15"
-                },
-                "score": 0.95
-            }
-        }
-
+    content: str
+    score: float
+    metadata: Dict[str, Any] = {}
 
 class SearchResponse(BaseModel):
-    """Search results response"""
-    query: str = Field(..., description="Original search query")
-    results: List[SearchResult] = Field(..., description="List of matching documents")
-    total_results: int = Field(..., description="Total number of results")
-    search_time_ms: float = Field(..., description="Search time in milliseconds")
+    results: List[SearchResult]
+    query: str
+    total_results: int
 
+class IntentCacheQuery(BaseModel):
+    user_request: str
 
-class DocumentInput(BaseModel):
-    """Document to add to the knowledge base"""
-    content: str = Field(
-        ...,
-        description="Document content",
-        min_length=10,
-        max_length=10000
-    )
-    metadata: Optional[Dict] = Field(
-        default={},
-        description="Document metadata (source, category, etc.)",
-        example={
-            "source": "AWS Documentation",
-            "category": "security",
-            "provider": "aws",
-            "resource_type": "iam"
-        }
-    )
-    collection: Optional[str] = Field(
-        default=DEFAULT_COLLECTION,
-        description="Collection to add document to"
-    )
-    document_id: Optional[str] = Field(
-        default=None,
-        description="Custom document ID (auto-generated if not provided)"
-    )
+class CachedIntentResult(BaseModel):
+    cached: bool
+    intent: Optional[Dict[str, Any]] = None
+    similarity_score: Optional[float] = None
 
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "content": "IAM Best Practice: Always use IAM roles instead of long-term access keys for applications running on EC2 instances. This eliminates the need to manage and rotate credentials manually.",
-                "metadata": {
-                    "source": "AWS Security Best Practices",
-                    "category": "security",
-                    "provider": "aws",
-                    "resource_type": "iam",
-                    "importance": "high"
-                },
-                "collection": "aws_best_practices",
-                "document_id": "iam_roles_001"
-            }
-        }
-
-
-class DocumentResponse(BaseModel):
-    """Response after adding a document"""
-    id: str = Field(..., description="Document ID")
-    collection: str = Field(..., description="Collection name")
-    status: str = Field(..., description="Operation status")
-    message: str = Field(..., description="Status message")
-
-
-class BulkDocumentInput(BaseModel):
-    """Multiple documents to add at once"""
-    documents: List[DocumentInput] = Field(
-        ...,
-        description="List of documents to add",
-        min_length=1,
-        max_length=100
-    )
-
-
-class CollectionInfo(BaseModel):
-    """Collection information"""
-    name: str = Field(..., description="Collection name")
-    count: int = Field(..., description="Number of documents")
-    metadata: Optional[Dict] = Field(default=None, description="Collection metadata")
-
-
-class CollectionCreate(BaseModel):
-    """Create a new collection"""
-    name: str = Field(
-        ...,
-        description="Collection name",
-        example="terraform_templates",
-        min_length=3,
-        max_length=50
-    )
-    metadata: Optional[Dict] = Field(
-        default=None,
-        description="Collection metadata",
-        example={"description": "Terraform module templates", "version": "1.0"}
-    )
-
-
-class HealthResponse(BaseModel):
-    """Health check response"""
-    status: str = Field(..., description="Service status")
-    qdrant: str = Field(..., description="Qdrant connection status")
-    claude_api: str = Field(..., description="Claude API status")
-    collections_count: int = Field(..., description="Number of collections")
-    total_documents: int = Field(..., description="Total documents across all collections")
-    timestamp: str = Field(..., description="Check timestamp")
-
-
-class StatsResponse(BaseModel):
-    """Knowledge base statistics"""
-    total_collections: int
-    total_documents: int
-    collections: List[CollectionInfo]
-    storage_info: Dict
+class StoreIntentRequest(BaseModel):
+    user_request: str
+    intent: Dict[str, Any]
 
 
 # ============== Helper Functions ==============
 
 def get_embedding(text: str) -> List[float]:
-    """
-    Generate embedding for text using Claude AI.
-    Uses a simple hash-based approach for demo; replace with actual embedding API.
-    """
-    # Note: Claude doesn't have a direct embedding API yet
-    # Using a deterministic hash-based embedding for demonstration
-    # In production, use OpenAI embeddings or similar
-    
-    # Simple deterministic embedding based on text hash
-    text_hash = hashlib.sha256(text.encode()).hexdigest()
-    embedding = []
-    for i in range(0, min(len(text_hash), EMBEDDING_DIMENSION * 2), 2):
-        byte_val = int(text_hash[i:i+2], 16)
-        embedding.append((byte_val - 128) / 128.0)
-    
-    # Pad to EMBEDDING_DIMENSION dimensions if needed
-    while len(embedding) < EMBEDDING_DIMENSION:
-        embedding.append(0.0)
-    
-    return embedding[:EMBEDDING_DIMENSION]
-
-
-def get_or_create_collection(name: str):
-    """Get existing collection or create new one in Qdrant"""
+    """Generate embedding using LOCAL model (no API call!)"""
     try:
-        # Check if collection exists
+        if not embedding_model:
+            raise Exception("Embedding model not loaded")
+        
+        embedding = embedding_model.encode(text, convert_to_tensor=False)
+        embedding_list = embedding.tolist()
+        
+        if len(embedding_list) != EMBEDDING_DIMENSION:
+            raise ValueError(f"Expected {EMBEDDING_DIMENSION}D, got {len(embedding_list)}D")
+        
+        return embedding_list
+        
+    except Exception as e:
+        logger.error(f"Embedding generation failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate embedding: {str(e)}")
+
+
+def ensure_collection_exists(collection_name: str):
+    """Ensure Qdrant collection exists"""
+    try:
         collections = qdrant_client.get_collections().collections
         collection_names = [c.name for c in collections]
         
-        if name not in collection_names:
-            # Create new collection
+        if collection_name not in collection_names:
+            logger.info(f"Creating collection: {collection_name}")
             qdrant_client.create_collection(
-                collection_name=name,
-                vectors_config=VectorParams(
-                    size=EMBEDDING_DIMENSION,
-                    distance=Distance.COSINE
-                )
+                collection_name=collection_name,
+                vectors_config=VectorParams(size=EMBEDDING_DIMENSION, distance=Distance.COSINE)
             )
-        
-        return name
+            logger.info(f"Collection created: {collection_name}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Collection error: {str(e)}")
-
-
-def generate_document_id(content: str) -> str:
-    """Generate unique document ID based on content hash"""
-    content_hash = hashlib.md5(content.encode()).hexdigest()[:8]
-    return f"{content_hash}{uuid.uuid4().hex[:4]}"
-
-
-def string_to_int_id(string_id: str) -> int:
-    """Convert string ID to integer for Qdrant"""
-    return int(hashlib.md5(string_id.encode()).hexdigest()[:15], 16)
+        logger.error(f"Failed to ensure collection exists: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ============== API Endpoints ==============
 
-@app.get(
-    "/",
-    tags=["Health & Status"],
-    summary="Service Status",
-    description="Quick health check to verify the RAG service is running"
-)
+@app.get("/")
 async def root():
-    """Quick health check endpoint"""
     return {
-        "service": "RAG Service",
+        "service": "RAG Service - Local Embeddings",
         "status": "healthy",
+        "embedding_model": EMBEDDING_MODEL_NAME,
+        "embedding_dimension": EMBEDDING_DIMENSION,
+        "embedding_type": "LOCAL (No API calls - 100% FREE)",
         "timestamp": datetime.now().isoformat(),
-        "version": "1.0.0",
-        "docs": "/docs"
+        "version": "3.0.0"
     }
 
 
-@app.post(
-    "/search",
-    response_model=SearchResponse,
-    tags=["Search"],
-    summary="Semantic Search",
-    description="""
-Search the knowledge base using natural language queries.
-
-### How it works:
-1. Query is converted to embedding
-2. ChromaDB finds most similar documents
-3. Results ranked by similarity score
-
-### Use Cases:
-- Find VPC best practices
-- Get security recommendations
-- Retrieve relevant Terraform templates
-- Look up cost optimization tips
-"""
-)
-async def search(query: SearchQuery):
-    """
-    Perform semantic search across the knowledge base.
-    
-    Returns documents most relevant to the natural language query,
-    ranked by similarity score.
-    """
-    import time
-    start_time = time.time()
-    
+@app.post("/search", response_model=SearchResponse)
+async def search_best_practices(request: SearchRequest):
     try:
-        # Ensure collection exists
-        get_or_create_collection(query.collection)
+        if not qdrant_client:
+            raise HTTPException(status_code=503, detail="Qdrant not available")
         
-        # Generate query embedding
-        query_embedding = get_embedding(query.query)
+        ensure_collection_exists(BEST_PRACTICES_COLLECTION)
+        query_embedding = get_embedding(request.query)
         
-        # Build filter if metadata provided
-        query_filter = None
-        if query.filter_metadata:
-            conditions = []
-            for key, value in query.filter_metadata.items():
-                conditions.append(
-                    FieldCondition(
-                        key=key,
-                        match=MatchValue(value=value)
-                    )
-                )
-            if conditions:
-                query_filter = Filter(must=conditions)
-        
-        # Perform search in Qdrant
-        results = qdrant_client.search(
-            collection_name=query.collection,
+        search_results = qdrant_client.search(
+            collection_name=BEST_PRACTICES_COLLECTION,
             query_vector=query_embedding,
-            limit=query.n_results,
-            query_filter=query_filter,
-            with_payload=True
+            limit=request.limit
         )
         
-        # Format results
-        search_results = []
-        for result in results:
-            payload = result.payload or {}
-            search_results.append(SearchResult(
-                id=payload.get('doc_id', str(result.id)),
-                content=payload.get('content', ''),
-                metadata={k: v for k, v in payload.items() if k not in ['content', 'doc_id']},
-                score=round(result.score, 4)
-            ))
-        
-        # Calculate search time
-        search_time = (time.time() - start_time) * 1000
-        
-        return SearchResponse(
-            query=query.query,
-            results=search_results,
-            total_results=len(search_results),
-            search_time_ms=round(search_time, 2)
-        )
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
-
-
-@app.post(
-    "/documents",
-    response_model=DocumentResponse,
-    tags=["Documents"],
-    summary="Add Document",
-    description="""
-Add a single document to the knowledge base.
-
-### Document will be:
-1. Processed and chunked (if large)
-2. Embedded using AI
-3. Stored in ChromaDB with metadata
-
-### Best Practices:
-- Keep documents focused on single topics
-- Add rich metadata for filtering
-- Use consistent categories
-"""
-)
-async def add_document(document: DocumentInput):
-    """
-    Add a document to the knowledge base.
-    
-    The document will be embedded and stored in Qdrant
-    for semantic search.
-    """
-    try:
-        # Ensure collection exists
-        get_or_create_collection(document.collection)
-        
-        # Generate document ID if not provided
-        doc_id = document.document_id or generate_document_id(document.content)
-        
-        # Generate embedding
-        embedding = get_embedding(document.content)
-        
-        # Build payload with metadata
-        payload = document.metadata.copy() if document.metadata else {}
-        payload["content"] = document.content
-        payload["doc_id"] = doc_id
-        payload["added_at"] = datetime.now().isoformat()
-        payload["content_length"] = len(document.content)
-        
-        # Convert string ID to integer for Qdrant
-        point_id = string_to_int_id(doc_id)
-        
-        # Add to Qdrant
-        qdrant_client.upsert(
-            collection_name=document.collection,
-            points=[
-                PointStruct(
-                    id=point_id,
-                    vector=embedding,
-                    payload=payload
-                )
-            ]
-        )
-        
-        return DocumentResponse(
-            id=doc_id,
-            collection=document.collection,
-            status="success",
-            message=f"Document added successfully with ID: {doc_id}"
-        )
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to add document: {str(e)}")
-
-
-@app.post(
-    "/documents/bulk",
-    tags=["Documents"],
-    summary="Add Multiple Documents",
-    description="Add multiple documents to the knowledge base in a single request"
-)
-async def add_documents_bulk(bulk_input: BulkDocumentInput):
-    """
-    Add multiple documents at once.
-    
-    More efficient than adding documents one by one.
-    """
-    try:
-        results = []
-        errors = []
-        
-        # Group documents by collection
-        docs_by_collection = {}
-        for doc in bulk_input.documents:
-            if doc.collection not in docs_by_collection:
-                docs_by_collection[doc.collection] = []
-            docs_by_collection[doc.collection].append(doc)
-        
-        # Process each collection
-        for collection_name, docs in docs_by_collection.items():
-            try:
-                # Ensure collection exists
-                get_or_create_collection(collection_name)
-                
-                # Prepare points for batch insert
-                points = []
-                for doc in docs:
-                    doc_id = doc.document_id or generate_document_id(doc.content)
-                    embedding = get_embedding(doc.content)
-                    
-                    payload = doc.metadata.copy() if doc.metadata else {}
-                    payload["content"] = doc.content
-                    payload["doc_id"] = doc_id
-                    payload["added_at"] = datetime.now().isoformat()
-                    payload["content_length"] = len(doc.content)
-                    
-                    point_id = string_to_int_id(doc_id)
-                    
-                    points.append(
-                        PointStruct(
-                            id=point_id,
-                            vector=embedding,
-                            payload=payload
-                        )
-                    )
-                    results.append({"id": doc_id, "status": "success"})
-                
-                # Batch insert
-                qdrant_client.upsert(
-                    collection_name=collection_name,
-                    points=points
-                )
-                
-            except Exception as e:
-                for doc in docs:
-                    errors.append({"content_preview": doc.content[:50], "error": str(e)})
-        
-        return {
-            "total": len(bulk_input.documents),
-            "successful": len(results),
-            "failed": len(errors),
-            "results": results,
-            "errors": errors if errors else None
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Bulk add failed: {str(e)}")
-
-
-@app.get(
-    "/documents/{collection}/{document_id}",
-    tags=["Documents"],
-    summary="Get Document",
-    description="Retrieve a specific document by ID"
-)
-async def get_document(collection: str, document_id: str):
-    """Get a specific document by ID"""
-    try:
-        # Convert string ID to integer
-        point_id = string_to_int_id(document_id)
-        
-        # Retrieve from Qdrant
-        results = qdrant_client.retrieve(
-            collection_name=collection,
-            ids=[point_id],
-            with_payload=True
-        )
-        
-        if not results:
-            raise HTTPException(status_code=404, detail="Document not found")
-        
-        payload = results[0].payload or {}
-        
-        return {
-            "id": payload.get('doc_id', document_id),
-            "content": payload.get('content', None),
-            "metadata": {k: v for k, v in payload.items() if k not in ['content', 'doc_id']}
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get document: {str(e)}")
-
-
-@app.delete(
-    "/documents/{collection}/{document_id}",
-    tags=["Documents"],
-    summary="Delete Document",
-    description="Delete a document from the knowledge base"
-)
-async def delete_document(collection: str, document_id: str):
-    """Delete a document by ID"""
-    try:
-        # Convert string ID to integer
-        point_id = string_to_int_id(document_id)
-        
-        # Delete from Qdrant
-        qdrant_client.delete(
-            collection_name=collection,
-            points_selector=[point_id]
-        )
-        
-        return {
-            "status": "success",
-            "message": f"Document {document_id} deleted from {collection}"
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to delete document: {str(e)}")
-
-
-@app.get(
-    "/collections",
-    response_model=List[CollectionInfo],
-    tags=["Collections"],
-    summary="List Collections",
-    description="List all collections in the knowledge base"
-)
-async def list_collections():
-    """List all available collections"""
-    try:
-        collections = qdrant_client.get_collections().collections
-        
-        result = []
-        for coll in collections:
-            # Get collection info
-            coll_info = qdrant_client.get_collection(coll.name)
-            result.append(CollectionInfo(
-                name=coll.name,
-                count=coll_info.points_count,
-                metadata={"vectors_count": coll_info.vectors_count}
-            ))
-        
-        return result
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to list collections: {str(e)}")
-
-
-@app.post(
-    "/collections",
-    tags=["Collections"],
-    summary="Create Collection",
-    description="Create a new collection for organizing documents"
-)
-async def create_collection(collection: CollectionCreate):
-    """Create a new collection"""
-    try:
-        qdrant_client.create_collection(
-            collection_name=collection.name,
-            vectors_config=VectorParams(
-                size=EMBEDDING_DIMENSION,
-                distance=Distance.COSINE
+        results = [
+            SearchResult(
+                content=result.payload.get('content', ''),
+                score=result.score,
+                metadata=result.payload.get('metadata', {})
             )
-        )
-        
-        return {
-            "status": "success",
-            "message": f"Collection '{collection.name}' created",
-            "name": collection.name
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to create collection: {str(e)}")
-
-
-@app.delete(
-    "/collections/{name}",
-    tags=["Collections"],
-    summary="Delete Collection",
-    description="Delete a collection and all its documents"
-)
-async def delete_collection(name: str):
-    """Delete a collection"""
-    try:
-        qdrant_client.delete_collection(name)
-        
-        return {
-            "status": "success",
-            "message": f"Collection '{name}' deleted"
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to delete collection: {str(e)}")
-
-
-@app.post(
-    "/seed",
-    tags=["Documents"],
-    summary="Seed Knowledge Base",
-    description="Populate the knowledge base with default AWS best practices and templates"
-)
-async def seed_knowledge_base():
-    """
-    Seed the knowledge base with default AWS best practices.
-    
-    Adds a curated set of documents covering:
-    - VPC and networking
-    - Security best practices
-    - Cost optimization
-    - Terraform patterns
-    """
-    try:
-        # Default AWS best practices
-        default_documents = [
-            {
-                "content": "VPC Best Practice: Use a /16 CIDR block for production VPCs (e.g., 10.0.0.0/16) to provide 65,536 IP addresses and room for growth. Always deploy resources across at least 2 Availability Zones for high availability.",
-                "metadata": {"category": "networking", "resource": "vpc", "importance": "high"}
-            },
-            {
-                "content": "Subnet Design: Create separate subnets for public, private, and data tiers. Public subnets should have route to Internet Gateway, private subnets route through NAT Gateway, and data subnets should have no internet access.",
-                "metadata": {"category": "networking", "resource": "subnet", "importance": "high"}
-            },
-            {
-                "content": "NAT Gateway: Deploy NAT Gateways in each AZ for high availability. Single NAT Gateway creates a single point of failure. Cost is approximately $32/month per NAT Gateway plus data processing charges.",
-                "metadata": {"category": "networking", "resource": "nat_gateway", "importance": "medium"}
-            },
-            {
-                "content": "Security Groups: Follow the principle of least privilege. Only open required ports, use security group references instead of CIDR blocks where possible, and add descriptions to all rules.",
-                "metadata": {"category": "security", "resource": "security_group", "importance": "high"}
-            },
-            {
-                "content": "IAM Best Practice: Use IAM roles instead of access keys for EC2 instances and Lambda functions. Enable MFA for all human users. Use AWS Organizations SCPs for guardrails.",
-                "metadata": {"category": "security", "resource": "iam", "importance": "high"}
-            },
-            {
-                "content": "Encryption: Enable encryption at rest for all data stores (S3, EBS, RDS). Use AWS KMS for key management. Enable encryption in transit using TLS 1.2+.",
-                "metadata": {"category": "security", "resource": "encryption", "importance": "high"}
-            },
-            {
-                "content": "EC2 Sizing: Start with smaller instance types and scale up based on metrics. Use t3/t3a for burstable workloads, m5/m6i for general purpose. Consider Spot instances for non-critical workloads (up to 90% savings).",
-                "metadata": {"category": "cost", "resource": "ec2", "importance": "medium"}
-            },
-            {
-                "content": "Tagging Strategy: Implement consistent tagging with at minimum: Name, Environment, Owner, CostCenter, Project. Use AWS Tag Policies for enforcement.",
-                "metadata": {"category": "management", "resource": "tags", "importance": "high"}
-            },
-            {
-                "content": "Terraform State: Store Terraform state in S3 with versioning enabled. Use DynamoDB for state locking. Never commit state files to version control.",
-                "metadata": {"category": "terraform", "resource": "state", "importance": "high"}
-            },
-            {
-                "content": "Terraform Modules: Use modules for reusable components. Pin module versions. Use consistent naming conventions. Keep modules focused on single responsibility.",
-                "metadata": {"category": "terraform", "resource": "modules", "importance": "medium"}
-            },
-            {
-                "content": "RDS Best Practice: Enable Multi-AZ for production databases. Use encryption at rest. Configure automated backups with appropriate retention. Right-size instance types based on actual usage.",
-                "metadata": {"category": "database", "resource": "rds", "importance": "high"}
-            },
-            {
-                "content": "S3 Security: Block public access by default. Enable versioning for important buckets. Use lifecycle policies to manage costs. Enable server-side encryption.",
-                "metadata": {"category": "storage", "resource": "s3", "importance": "high"}
-            }
+            for result in search_results
         ]
         
-        # Ensure collection exists
-        get_or_create_collection(DEFAULT_COLLECTION)
+        logger.info(f"Search completed: {len(results)} results")
         
-        # Prepare points for batch insert
-        points = []
-        added = 0
-        
-        for doc in default_documents:
-            try:
-                doc_id = generate_document_id(doc["content"])
-                embedding = get_embedding(doc["content"])
-                
-                payload = doc["metadata"].copy()
-                payload["content"] = doc["content"]
-                payload["doc_id"] = doc_id
-                payload["added_at"] = datetime.now().isoformat()
-                payload["source"] = "AWS Best Practices Seed"
-                
-                point_id = string_to_int_id(doc_id)
-                
-                points.append(
-                    PointStruct(
-                        id=point_id,
-                        vector=embedding,
-                        payload=payload
-                    )
-                )
-                added += 1
-            except Exception as e:
-                continue  # Skip on error
-        
-        # Batch insert all documents
-        if points:
-            qdrant_client.upsert(
-                collection_name=DEFAULT_COLLECTION,
-                points=points
-            )
-        
-        # Get collection count
-        coll_info = qdrant_client.get_collection(DEFAULT_COLLECTION)
-        
-        return {
-            "status": "success",
-            "message": f"Knowledge base seeded with {added} documents",
-            "collection": DEFAULT_COLLECTION,
-            "total_documents": coll_info.points_count
-        }
+        return SearchResponse(results=results, query=request.query, total_results=len(results))
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to seed knowledge base: {str(e)}")
+        logger.error(f"Search failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get(
-    "/health",
-    response_model=HealthResponse,
-    tags=["Health & Status"],
-    summary="Detailed Health Check",
-    description="Comprehensive health check including ChromaDB and Claude API status"
-)
-async def health_check():
-    """
-    Detailed health check with database and API status.
-    """
+@app.post("/intent/check-cache", response_model=CachedIntentResult)
+async def check_intent_cache(request: IntentCacheQuery):
     try:
-        # Check Qdrant
-        collections = qdrant_client.get_collections().collections
-        total_docs = 0
-        for coll in collections:
-            coll_info = qdrant_client.get_collection(coll.name)
-            total_docs += coll_info.points_count
+        if not qdrant_client:
+            raise HTTPException(status_code=503, detail="Qdrant not available")
         
-        # Check Claude API
-        claude_status = "connected"
-        try:
-            test_msg = claude_client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=10,
-                messages=[{"role": "user", "content": "test"}]
-            )
-        except Exception:
-            claude_status = "error"
+        ensure_collection_exists(INTENT_CACHE_COLLECTION)
+        query_embedding = get_embedding(request.user_request)
         
-        return HealthResponse(
-            status="healthy",
-            qdrant="connected",
-            claude_api=claude_status,
-            collections_count=len(collections),
-            total_documents=total_docs,
-            timestamp=datetime.now().isoformat()
-        )
-        
-    except Exception as e:
-        return HealthResponse(
-            status="degraded",
-            qdrant="error",
-            claude_api="unknown",
-            collections_count=0,
-            total_documents=0,
-            timestamp=datetime.now().isoformat()
-        )
-
-
-# ============== Intent Caching Endpoints ==============
-
-@app.post(
-    "/intent/check-cache",
-    response_model=CachedIntentResult,
-    tags=["Intent Cache"],
-    summary="Check for Cached Intent",
-    description="""
-Check if a similar user request has been parsed before and retrieve the cached intent.
-
-### How it works:
-1. Converts user request to vector embedding
-2. Searches cached_intents collection in Qdrant  
-3. If similarity >= threshold (default 0.85), returns cached intent
-4. If no match, returns found: false
-
-### Benefits:
-- ⚡ Fast: ~50ms vs ~5s for Claude AI call
-- 💰 Cost: Free (no Claude API call)
-- 📊 Consistent: Same input = same output
-"""
-)
-async def check_cached_intent(query: IntentCacheQuery):
-    """Check if a similar user request exists in cache."""
-    import time
-    start_time = time.time()
-    
-    try:
-        get_or_create_collection(INTENT_CACHE_COLLECTION)
-        query_embedding = get_embedding(query.user_request)
-        
-        results = qdrant_client.search(
+        search_results = qdrant_client.search(
             collection_name=INTENT_CACHE_COLLECTION,
             query_vector=query_embedding,
-            limit=1,
-            with_payload=True
+            limit=1
         )
         
-        if results and len(results) > 0:
-            top_result = results[0]
-            similarity = round(top_result.score, 4)
+        if search_results and search_results[0].score >= SIMILARITY_THRESHOLD:
+            cached_intent = search_results[0].payload.get('intent')
+            similarity_score = search_results[0].score
             
-            if similarity >= query.similarity_threshold:
-                payload = top_result.payload or {}
-                search_time = (time.time() - start_time) * 1000
-                
-                logger.info(f"✅ Intent cache HIT! Similarity: {similarity}, Time: {search_time:.2f}ms")
-                
-                return CachedIntentResult(
-                    found=True,
-                    similarity_score=similarity,
-                    user_request=payload.get('user_request', ''),
-                    intent=payload.get('intent', {}),
-                    cache_timestamp=payload.get('timestamp', '')
-                )
-        
-        search_time = (time.time() - start_time) * 1000
-        logger.info(f"❌ Intent cache MISS. Time: {search_time:.2f}ms")
-        
-        return CachedIntentResult(found=False, similarity_score=None, user_request=None, intent=None, cache_timestamp=None)
+            logger.info(f"Cache HIT: similarity={similarity_score:.3f}")
+            return CachedIntentResult(cached=True, intent=cached_intent, similarity_score=similarity_score)
+        else:
+            logger.info("Cache MISS")
+            return CachedIntentResult(cached=False)
         
     except Exception as e:
-        logger.error(f"Intent cache check failed: {str(e)}")
-        return CachedIntentResult(found=False, similarity_score=None, user_request=None, intent=None, cache_timestamp=None)
+        logger.error(f"Cache check failed: {e}")
+        return CachedIntentResult(cached=False)
 
 
-@app.post(
-    "/intent/store",
-    tags=["Intent Cache"],
-    summary="Store Parsed Intent",
-    description="Store a newly parsed intent in the cache for future reuse"
-)
+@app.post("/intent/store")
 async def store_intent(request: StoreIntentRequest):
-    """Store a parsed intent in the cache."""
     try:
-        get_or_create_collection(INTENT_CACHE_COLLECTION)
-        request_embedding = get_embedding(request.user_request)
-        point_id = str(uuid.uuid4())
-        cache_id = f"cached_intent_{point_id[:8]}"
-        timestamp = datetime.now().isoformat()
+        if not qdrant_client:
+            raise HTTPException(status_code=503, detail="Qdrant not available")
+        
+        ensure_collection_exists(INTENT_CACHE_COLLECTION)
+        embedding = get_embedding(request.user_request)
+        point_id = hashlib.md5(request.user_request.encode()).hexdigest()
         
         qdrant_client.upsert(
             collection_name=INTENT_CACHE_COLLECTION,
-            points=[
-                PointStruct(
-                    id=point_id,
-                    vector=request_embedding,
-                    payload={
-                        "cache_id": cache_id,
-                        "user_request": request.user_request,
-                        "intent": request.intent,
-                        "timestamp": timestamp
-                    }
-                )
-            ]
+            points=[PointStruct(
+                id=point_id,
+                vector=embedding,
+                payload={
+                    "user_request": request.user_request,
+                    "intent": request.intent,
+                    "timestamp": datetime.now().isoformat()
+                }
+            )]
         )
         
-        logger.info(f"✅ Stored intent in cache: {cache_id}")
-        return {"message": "Intent cached successfully", "cache_id": cache_id, "timestamp": timestamp}
+        logger.info(f"Intent cached: {request.user_request[:50]}...")
+        return {"status": "success", "message": "Intent cached successfully", "cache_id": point_id}
         
     except Exception as e:
-        logger.error(f"Failed to store intent: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to store intent in cache: {str(e)}")
+        logger.error(f"Failed to cache intent: {e}")
+        return {"status": "warning", "message": f"Failed to cache: {str(e)}"}
 
 
-@app.get(
-    "/intent/stats",
-    tags=["Intent Cache"],
-    summary="Cache Statistics",
-    description="Get statistics about the intent cache"
-)
+@app.get("/intent/stats")
 async def get_cache_stats():
-    """Get statistics about cached intents"""
     try:
+        if not qdrant_client:
+            raise HTTPException(status_code=503, detail="Qdrant not available")
+        
         try:
-            coll_info = qdrant_client.get_collection(INTENT_CACHE_COLLECTION)
-            cache_count = coll_info.points_count
+            collection_info = qdrant_client.get_collection(INTENT_CACHE_COLLECTION)
+            cached_count = collection_info.points_count
         except:
-            cache_count = 0
+            cached_count = 0
+        
+        try:
+            practices_info = qdrant_client.get_collection(BEST_PRACTICES_COLLECTION)
+            practices_count = practices_info.points_count
+        except:
+            practices_count = 0
         
         return {
-            "cache_collection": INTENT_CACHE_COLLECTION,
-            "total_cached_intents": cache_count,
+            "cached_intents": cached_count,
+            "best_practices": practices_count,
             "similarity_threshold": SIMILARITY_THRESHOLD,
-            "status": "active" if cache_count > 0 else "empty"
+            "embedding_dimension": EMBEDDING_DIMENSION,
+            "embedding_model": EMBEDDING_MODEL_NAME,
+            "embedding_type": "LOCAL (No API calls)"
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get cache stats: {str(e)}")
-
-
-@app.get(
-    "/stats",
-    response_model=StatsResponse,
-    tags=["Health & Status"],
-    summary="Knowledge Base Statistics",
-    description="Get detailed statistics about the knowledge base"
-)
-async def get_stats():
-    """Get knowledge base statistics"""
-    try:
-        collections = qdrant_client.get_collections().collections
-        
-        collection_info = []
-        total_docs = 0
-        
-        for coll in collections:
-            coll_info = qdrant_client.get_collection(coll.name)
-            count = coll_info.points_count
-            total_docs += count
-            collection_info.append(CollectionInfo(
-                name=coll.name,
-                count=count,
-                metadata={"vectors_count": coll_info.vectors_count}
-            ))
-        
-        return StatsResponse(
-            total_collections=len(collections),
-            total_documents=total_docs,
-            collections=collection_info,
-            storage_info={
-                "backend": "qdrant",
-                "host": QDRANT_HOST,
-                "port": QDRANT_PORT
-            }
-        )
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get stats: {str(e)}")
+        logger.error(f"Failed to get stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/health")
+async def health_check():
+    qdrant_status = "connected" if qdrant_client else "disconnected"
+    model_status = "loaded" if embedding_model else "not loaded"
+    
+    return {
+        "status": "healthy",
+        "qdrant": qdrant_status,
+        "embedding_model": EMBEDDING_MODEL_NAME,
+        "embedding_status": model_status,
+        "embedding_dimension": EMBEDDING_DIMENSION,
+        "embedding_type": "LOCAL (No API calls - 100% FREE)",
+        "timestamp": datetime.now().isoformat()
+    }
 
 
 if __name__ == "__main__":

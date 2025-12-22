@@ -10,7 +10,7 @@ from pathlib import Path
 
 def check_environment():
     """Validate required environment variables"""
-    required_vars = ["ANTHROPIC_API_KEY"]
+    required_vars = ["GEMINI_API_KEY"]
     missing_vars = []
     
     for var in required_vars:
@@ -23,7 +23,7 @@ def check_environment():
         for var in missing_vars:
             print(f"  export {var}=your-value")
         print("\nOr use Docker:")
-        print("  docker run -e ANTHROPIC_API_KEY=your-key -p 8001:8001 ai-service")
+        print("  docker run -e GEMINI_API_KEY=your-key -p 8001:8001 ai-service")
         return False
     
     return True
@@ -32,7 +32,7 @@ def check_dependencies():
     """Check if all required packages are installed"""
     try:
         import fastapi
-        import anthropic
+        import google.generativeai
         import pydantic
         import uvicorn
         return True

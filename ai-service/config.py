@@ -15,9 +15,9 @@ class Settings(BaseSettings):
     SERVICE_PORT: int = 8001
     DEBUG: bool = False
     
-    # Claude AI Configuration
-    ANTHROPIC_API_KEY: str = "your-api-key-here"
-    CLAUDE_MODEL: str = "claude-sonnet-4-20250514"
+    # Google Gemini AI Configuration (FREE API)
+    GEMINI_API_KEY: str = "your-gemini-api-key-here"
+    GEMINI_MODEL: str = "gemini-2.5-flash-lite"
     MAX_TOKENS: int = 4000
     
     # Other Microservices URLs
@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     
     # Timeouts
     REQUEST_TIMEOUT: int = 30
-    CLAUDE_API_TIMEOUT: int = 60
+    GEMINI_API_TIMEOUT: int = 60
     
     # Logging
     LOG_LEVEL: str = "INFO"
@@ -90,15 +90,34 @@ Generate Terraform code following these guidelines:
 6. Use variables for reusable values
 7. Follow AWS Well-Architected Framework
 
-IMPORTANT - Provider Configuration:
-- DO NOT include terraform {} or required_providers blocks
-- DO NOT include provider "aws" {} blocks
-- ONLY include resource, data, variable, output, and locals blocks
-- The provider configuration will be added separately
+CRITICAL - Provider Configuration Rules:
+⛔ DO NOT include terraform {{}} blocks
+⛔ DO NOT include required_providers blocks
+⛔ DO NOT include provider "aws" {{}} blocks
+⛔ DO NOT include any provider configuration
+✅ ONLY include: resource, data, variable, output, and locals blocks
+✅ Start directly with resource blocks
+✅ The provider configuration already exists in a separate file
+
+EXAMPLE OF WHAT TO GENERATE:
+```
+# VPC Configuration
+resource "aws_vpc" "main" {{
+  cidr_block = "10.0.0.0/16"
+  ...
+}}
+```
+
+EXAMPLE OF WHAT NOT TO GENERATE:
+```
+provider "aws" {{  # ⛔ DO NOT INCLUDE THIS
+  region = "us-east-1"
+}}
+```
 
 Return a JSON object with this structure:
 {{
-    "terraform_code": "complete Terraform code here (resources only, no provider blocks)",
+    "terraform_code": "complete Terraform code here (resources only, NO provider blocks)",
     "explanation": "brief explanation of what this creates",
     "resources_created": ["list of AWS resources"],
     "estimated_cost_info": "rough monthly cost estimate and key cost drivers"
@@ -111,8 +130,9 @@ IMPORTANT JSON FORMATTING RULES:
 - Use \\n for newlines in the terraform_code string
 - Ensure all strings are properly quoted and escaped
 - Do not use backticks around the JSON
+- Make absolutely sure NO provider blocks are in the terraform_code
 
-Make the code production-ready, secure, and well-documented. Return only valid JSON."""
+Make the code production-ready, secure, and well-documented. Return only valid JSON with NO PROVIDER BLOCKS."""
 
 
 CODE_REFINEMENT_PROMPT = """You are refining Terraform code based on feedback.

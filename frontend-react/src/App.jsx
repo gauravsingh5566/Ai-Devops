@@ -17,13 +17,15 @@ import {
   ChevronUp,
   AlertCircle,
   Server,
-  FileText
+  FileText,
+  LogOut
 } from 'lucide-react';
 import { aiService, ragService, mcpService, infraService, checkAllServices } from './services/api';
 import CodeEditor from './components/CodeEditor';
 import ValidationResults from './components/ValidationResults';
 import DeploymentProgress from './components/DeploymentProgress';
 import ServiceStatus from './components/ServiceStatus';
+import Login from './components/Login';
 
 const STEPS = {
   INPUT: 0,
@@ -35,6 +37,10 @@ const STEPS = {
 };
 
 function App() {
+  // Authentication state
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [username, setUsername] = useState('');
+  
   const [currentStep, setCurrentStep] = useState(STEPS.INPUT);
   const [userInput, setUserInput] = useState('');
   const [loading, setLoading] = useState(false);
@@ -65,12 +71,36 @@ function App() {
   const [serviceHealth, setServiceHealth] = useState([]);
   const [showServiceStatus, setShowServiceStatus] = useState(false);
 
+  // Check authentication on mount
+  useEffect(() => {
+    const auth = localStorage.getItem('isAuthenticated');
+    const savedUsername = localStorage.getItem('username');
+    if (auth === 'true' && savedUsername) {
+      setIsAuthenticated(true);
+      setUsername(savedUsername);
+    }
+  }, []);
+
   // Check service health on mount
   useEffect(() => {
+    if (!isAuthenticated) return;
     checkServices();
     const interval = setInterval(checkServices, 30000);
     return () => clearInterval(interval);
-  }, []);
+  }, [isAuthenticated]);
+
+  const handleLogin = (user) => {
+    setIsAuthenticated(true);
+    setUsername(user);
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem('isAuthenticated');
+    localStorage.removeItem('username');
+    setIsAuthenticated(false);
+    setUsername('');
+    resetAll();
+  };
 
   const checkServices = async () => {
     try {
@@ -267,27 +297,42 @@ function App() {
         }}
       />
 
-      {/* Header */}
-      <header className="bg-dark-surface border-b border-dark-border sticky top-0 z-50">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center space-x-3">
-              <div className="w-10 h-10 bg-gradient-to-br from-primary-500 to-primary-700 rounded-lg flex items-center justify-center">
-                <Terminal className="w-6 h-6 text-white" />
-              </div>
-              <div>
-                <h1 className="text-2xl font-bold bg-gradient-to-r from-primary-400 to-primary-600 bg-clip-text text-transparent">
-                  AI DevOps Assistant
-                </h1>
-                <p className="text-sm text-gray-400">Natural Language to AWS Infrastructure</p>
-              </div>
-            </div>
-            
-            <div className="flex items-center space-x-4">
-              <button
-                onClick={() => setShowServiceStatus(!showServiceStatus)}
-                className="btn btn-secondary flex items-center space-x-2"
-              >
+      {/* Show login if not authenticated */}
+      {!isAuthenticated ? (
+        <Login onLogin={handleLogin} />
+      ) : (
+        <>
+          {/* Header */}
+          <header className="bg-dark-surface border-b border-dark-border sticky top-0 z-50">
+            <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center space-x-3">
+                  <div className="w-10 h-10 bg-gradient-to-br from-primary-500 to-primary-700 rounded-lg flex items-center justify-center">
+                    <Terminal className="w-6 h-6 text-white" />
+                  </div>
+                  <div>
+                    <h1 className="text-2xl font-bold bg-gradient-to-r from-primary-400 to-primary-600 bg-clip-text text-transparent">
+                      AI DevOps Assistant
+                    </h1>
+                    <p className="text-sm text-gray-400">Natural Language to AWS Infrastructure</p>
+                  </div>
+                </div>
+                
+                <div className="flex items-center space-x-4">
+                  {/* User info */}
+                  <div className="flex items-center space-x-2 px-3 py-2 bg-dark-hover rounded-lg">
+                    <div className="w-8 h-8 bg-primary-600 rounded-full flex items-center justify-center">
+                      <span className="text-sm font-semibold text-white">
+                        {username.charAt(0).toUpperCase()}
+                      </span>
+                    </div>
+                    <span className="text-sm text-gray-300">{username}</span>
+                  </div>
+                  
+                  <button
+                    onClick={() => setShowServiceStatus(!showServiceStatus)}
+                    className="btn btn-secondary flex items-center space-x-2"
+                  >
                 <Activity className="w-4 h-4" />
                 <span>Services</span>
               </button>
@@ -301,6 +346,14 @@ function App() {
                   <span>New Request</span>
                 </button>
               )}
+              
+              <button
+                onClick={handleLogout}
+                className="btn btn-danger flex items-center space-x-2"
+              >
+                <LogOut className="w-4 h-4" />
+                <span>Logout</span>
+              </button>
             </div>
           </div>
         </div>
@@ -965,6 +1018,8 @@ function App() {
           </div>
         )}
       </main>
+      </>
+      )}
     </div>
   );
 }

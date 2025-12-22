@@ -11,20 +11,8 @@ from pathlib import Path
 
 def check_environment():
     """Validate required environment variables"""
-    required_vars = ["ANTHROPIC_API_KEY"]
-    missing_vars = []
-    
-    for var in required_vars:
-        if not os.getenv(var):
-            missing_vars.append(var)
-    
-    if missing_vars:
-        print(f"❌ ERROR: Missing required environment variables: {', '.join(missing_vars)}")
-        print("\nPlease set the following environment variables:")
-        for var in missing_vars:
-            print(f"  export {var}=your-value")
-        return False
-    
+    # No API key needed - using local embeddings!
+    print("✅ Using local embeddings - no API key required")
     return True
 
 
@@ -32,7 +20,7 @@ def check_dependencies():
     """Check if all required packages are installed"""
     try:
         import fastapi
-        import anthropic
+        from sentence_transformers import SentenceTransformer
         from qdrant_client import QdrantClient
         import pydantic
         import uvicorn
