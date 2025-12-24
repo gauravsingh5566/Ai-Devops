@@ -17,6 +17,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 import uuid
+import httpx
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -133,6 +134,9 @@ app.add_middleware(
 WORKSPACE_DIR = Path("/app/workspaces")
 WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
 
+# AI Service URL for plan validation
+AI_SERVICE_URL = os.getenv("AI_SERVICE_URL", "http://ai-service:8001")
+
 # In-memory deployment tracking (use database in production)
 deployments_db = {}
 deployment_counter = 0
@@ -219,11 +223,9 @@ class TerraformPlanResponse(BaseModel):
     """Terraform plan response"""
     deployment_id: str
     plan_output: str
-    plan_summary: Dict[str, int] = Field(
-        ...,
-        description="Summary of plan changes",
-        example={"add": 5, "change": 0, "destroy": 0}
-    )
+    resources_to_add: int
+    resources_to_change: int
+    resources_to_destroy: int
     plan_file_path: str
 
 
@@ -406,6 +408,56 @@ def extract_created_resources(apply_output: str) -> List[str]:
     resources.extend(matches)
     
     return resources
+
+
+async def validate_plan_with_ai(plan_output: str, terraform_code: str, deployment_id: str) -> Dict:
+    """
+    Call AI service to validate and fix terraform plan errors
+    
+    Returns:
+        {
+            'has_errors': bool,
+            'fixed_code': str,
+            'fixes_applied': list,
+            'needs_human_review': bool
+        }
+    """
+    try:
+        logger.info(f"Calling AI service to validate plan for deployment {deployment_id}")
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{AI_SERVICE_URL}/validate-plan",
+                json={
+                    "plan_output": plan_output,
+                    "terraform_code": terraform_code,
+                    "deployment_id": deployment_id
+                }
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                logger.info(f"AI validation complete: {len(result.get('fixes_applied', []))} fixes applied")
+                return result
+            else:
+                logger.error(f"AI validation failed: {response.status_code}")
+                return {
+                    'has_errors': True,
+                    'fixed_code': terraform_code,
+                    'fixes_applied': [],
+                    'needs_human_review': True,
+                    'analysis': 'AI validation service unavailable'
+                }
+                
+    except Exception as e:
+        logger.error(f"Failed to call AI validation service: {e}")
+        return {
+            'has_errors': True,
+            'fixed_code': terraform_code,
+            'fixes_applied': [],
+            'needs_human_review': True,
+            'analysis': f'AI validation failed: {str(e)}'
+        }
 
 
 # ============== API Endpoints ==============
@@ -605,15 +657,91 @@ async def terraform_plan(deployment_id: str):
             return TerraformPlanResponse(
                 deployment_id=deployment_id,
                 plan_output=stdout,
-                plan_summary=counts,
+                resources_to_add=counts["add"],
+                resources_to_change=counts["change"],
+                resources_to_destroy=counts["destroy"],
                 plan_file_path=str(plan_file)
             )
         else:
-            deployment["status"] = "failed"
-            deployment["error_message"] = f"Plan failed: {stderr}"
-            deployment["updated_at"] = datetime.now().isoformat()
+            # Plan failed - Try AI validation and auto-fix
+            logger.warning(f"Terraform plan failed for {deployment_id}. Attempting AI auto-fix...")
             
-            raise HTTPException(status_code=500, detail=f"Terraform plan failed: {stderr}")
+            # Read current terraform code
+            main_tf = workspace_path / "main.tf"
+            original_code = main_tf.read_text()
+            
+            # Call AI validator
+            validation_result = await validate_plan_with_ai(
+                plan_output=f"{stdout}\n{stderr}",
+                terraform_code=original_code,
+                deployment_id=deployment_id
+            )
+            
+            deployment["terraform_output"] += f"\n=== AI VALIDATION ===\n{validation_result.get('analysis', '')}\n"
+            
+            # Check if AI fixed the issues
+            if validation_result.get('auto_fix_successful'):
+                logger.info(f"AI auto-fix successful! Applying fixes and retrying plan...")
+                
+                # Write fixed code
+                fixed_code = validation_result['fixed_code']
+                main_tf.write_text(fixed_code)
+                
+                deployment["terraform_output"] += f"\n=== FIXES APPLIED ===\n"
+                for fix in validation_result['fixes_applied']:
+                    deployment["terraform_output"] += f"✓ {fix}\n"
+                
+                # Retry terraform plan with fixed code
+                success_retry, stdout_retry, stderr_retry = run_terraform_command(
+                    workspace_path,
+                    ["terraform", "plan", "-out=tfplan", "-no-color"]
+                )
+                
+                deployment["terraform_output"] += f"\n=== RETRY PLAN ===\n{stdout_retry}\n{stderr_retry}\n"
+                
+                if success_retry:
+                    counts = parse_terraform_plan(stdout_retry)
+                    
+                    deployment["status"] = "planned"
+                    deployment["current_step"] = "plan complete (auto-fixed)"
+                    deployment["progress_percentage"] = 50
+                    deployment["updated_at"] = datetime.now().isoformat()
+                    deployment["ai_fixes_applied"] = validation_result['fixes_applied']
+                    
+                    return TerraformPlanResponse(
+                        deployment_id=deployment_id,
+                        plan_output=f"AI Auto-Fix Applied:\n" + "\n".join(validation_result['fixes_applied']) + f"\n\n{stdout_retry}",
+                        resources_to_add=counts["add"],
+                        resources_to_change=counts["change"],
+                        resources_to_destroy=counts["destroy"],
+                        plan_file_path=str(plan_file)
+                    )
+                else:
+                    # Still failed after fix
+                    deployment["status"] = "failed"
+                    deployment["error_message"] = f"Plan failed even after AI fixes: {stderr_retry}"
+                    deployment["updated_at"] = datetime.now().isoformat()
+                    
+                    raise HTTPException(
+                        status_code=500, 
+                        detail=f"Terraform plan failed after AI fixes. {validation_result.get('analysis', '')}"
+                    )
+            else:
+                # AI couldn't auto-fix or needs human review
+                deployment["status"] = "failed"
+                deployment["error_message"] = f"Plan failed: {stderr}"
+                deployment["updated_at"] = datetime.now().isoformat()
+                deployment["ai_validation"] = validation_result
+                
+                error_detail = f"Terraform plan failed: {stderr}\n\nAI Analysis: {validation_result.get('analysis', '')}"
+                
+                if validation_result.get('suggestions'):
+                    error_detail += "\n\nSuggestions:\n" + "\n".join(validation_result['suggestions'])
+                
+                if validation_result.get('needs_human_review'):
+                    error_detail += "\n\n⚠️ This issue requires human review."
+                
+                raise HTTPException(status_code=500, detail=error_detail)
             
     except Exception as e:
         deployment["status"] = "failed"
@@ -628,12 +756,11 @@ async def terraform_plan(deployment_id: str):
     summary="Apply Terraform Changes",
     description="Run 'terraform apply' to create/update infrastructure"
 )
-async def terraform_apply(deployment_id: str, auto_approve: bool = True):
+async def terraform_apply(deployment_id: str, auto_approve: bool = False):
     """
     Apply Terraform plan to create infrastructure.
     
     This actually creates the AWS resources.
-    User already approved in UI by clicking "Deploy to AWS" button.
     """
     if deployment_id not in deployments_db:
         raise HTTPException(status_code=404, detail="Deployment not found")
@@ -647,8 +774,12 @@ async def terraform_apply(deployment_id: str, auto_approve: bool = True):
             detail="Deployment must be planned before applying. Run /plan first."
         )
     
-    # ✅ REMOVED: The manual approval check
-    # User already reviewed and approved the plan in the UI
+    # Check auto-approve
+    if not auto_approve and not deployment.get("auto_approve"):
+        raise HTTPException(
+            status_code=400,
+            detail="Manual approval required. Set auto_approve=true to proceed."
+        )
     
     # Update status
     deployment["status"] = "applying"
@@ -657,16 +788,15 @@ async def terraform_apply(deployment_id: str, auto_approve: bool = True):
     deployment["updated_at"] = datetime.now().isoformat()
     
     try:
-        # ✅ FIXED: Always use -auto-approve since user approved in UI
-        # Run terraform apply with plan file
-        plan_file = workspace_path / "tfplan"
+        # Run terraform apply
+        command = ["terraform", "apply", "-no-color"]
         
+        # Use plan file if it exists
+        plan_file = workspace_path / "tfplan"
         if plan_file.exists():
-            # Use the plan file (recommended)
-            command = ["terraform", "apply", "-auto-approve", "-no-color", "tfplan"]
+            command.extend(["-auto-approve", "tfplan"])
         else:
-            # Fallback if no plan file
-            command = ["terraform", "apply", "-auto-approve", "-no-color"]
+            command.append("-auto-approve")
         
         success, stdout, stderr = run_terraform_command(workspace_path, command)
         

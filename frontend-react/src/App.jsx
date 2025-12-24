@@ -57,6 +57,7 @@ function App() {
   const [validationResult, setValidationResult] = useState(null);
   const [deploymentData, setDeploymentData] = useState(null);
   const [planData, setPlanData] = useState(null);  // NEW: Store Terraform plan
+  const [aiFixes, setAiFixes] = useState([]);  // NEW: Store AI fixes applied
   const [deploymentName, setDeploymentName] = useState('');
   const [confirmDeploy, setConfirmDeploy] = useState(false);
   
@@ -129,6 +130,8 @@ function App() {
     setCostInfo('');
     setValidationResult(null);
     setDeploymentData(null);
+    setPlanData(null);
+    setAiFixes([]);
     setDeploymentName('');
     setConfirmDeploy(false);
     setExpandedSections({
@@ -246,7 +249,19 @@ function App() {
       setLoadingMessage('📋 Generating plan...');
       const plan = await infraService.planDeployment(deployment.deployment_id);
       setPlanData(plan);  // Store plan data
-      toast.success(`✅ Plan ready: ${plan.plan_summary?.add || 0} resources to add`);
+      
+      // Check if AI fixes were applied
+      if (plan.plan_output && plan.plan_output.includes('AI Auto-Fix Applied')) {
+        const fixesMatch = plan.plan_output.match(/AI Auto-Fix Applied:\n([\s\S]*?)\n\n/);
+        if (fixesMatch) {
+          const fixes = fixesMatch[1].split('\n').filter(f => f.trim());
+          setAiFixes(fixes);
+          toast.success(`✅ Plan ready with AI fixes: ${fixes.length} issue(s) resolved`, { duration: 5000 });
+        }
+      } else {
+        setAiFixes([]);
+        toast.success(`✅ Plan ready: ${plan.plan_summary?.add || 0} resources to add`);
+      }
       
       // STOP HERE - Show plan for user review and approval
       setCurrentStep(STEPS.PLAN_REVIEW);
@@ -894,6 +909,35 @@ function App() {
                   </div>
                 </div>
               </div>
+
+              {/* AI Fixes Section - NEW */}
+              {aiFixes && aiFixes.length > 0 && (
+                <div className="mt-6 bg-blue-500/10 border-2 border-blue-500/30 rounded-lg p-6">
+                  <div className="flex items-start space-x-3 mb-4">
+                    <div className="w-10 h-10 bg-blue-600 rounded-full flex items-center justify-center flex-shrink-0">
+                      <Zap className="w-5 h-5 text-white" />
+                    </div>
+                    <div className="flex-1">
+                      <h4 className="font-semibold text-blue-400 text-lg mb-1">🤖 AI Auto-Fix Applied</h4>
+                      <p className="text-sm text-gray-300 mb-3">
+                        The AI agent detected and automatically fixed {aiFixes.length} issue(s) during plan generation:
+                      </p>
+                      <div className="space-y-2">
+                        {aiFixes.map((fix, index) => (
+                          <div key={index} className="flex items-start space-x-2 bg-dark-hover p-3 rounded-lg">
+                            <CheckCircle2 className="w-4 h-4 text-blue-400 flex-shrink-0 mt-0.5" />
+                            <span className="text-sm text-gray-200">{fix.replace(/^[•✓]\s*/, '')}</span>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="mt-4 flex items-center space-x-2 text-xs text-blue-300">
+                        <Activity className="w-4 h-4" />
+                        <span>Powered by Gemini AI • Auto-validated and corrected</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
 
               {/* Plan Output */}
               <div className="bg-dark-bg rounded-lg p-4 border border-dark-border">

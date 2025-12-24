@@ -6,7 +6,7 @@ Natural Language to Infrastructure Code Generation using Google Gemini
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import google.generativeai as genai
 import httpx
 import os
@@ -14,6 +14,7 @@ import json
 import re
 import logging
 from datetime import datetime
+from plan_validator import create_plan_validator
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -47,6 +48,10 @@ else:
 # Using gemini-2.5-flash-lite for text generation (working, free tier)
 model = genai.GenerativeModel('gemini-2.5-flash-lite')
 
+# Initialize Plan Validator
+plan_validator = create_plan_validator(model)
+logger.info("Terraform Plan Validator initialized")
+
 # RAG Service URL
 RAG_SERVICE_URL = os.getenv("RAG_SERVICE_URL", "http://rag-service:8002")
 
@@ -71,6 +76,21 @@ class GenerateCodeResponse(BaseModel):
     explanation: str
     resources: list
     estimated_cost: str
+
+class ValidatePlanRequest(BaseModel):
+    plan_output: str = Field(..., description="Terraform plan output")
+    terraform_code: str = Field(..., description="Original Terraform code")
+    deployment_id: Optional[str] = Field(default=None, description="Deployment identifier")
+
+class ValidatePlanResponse(BaseModel):
+    has_errors: bool
+    errors: List[Dict[str, Any]]
+    fixes_applied: List[str]
+    fixed_code: str
+    analysis: str
+    suggestions: Optional[List[str]] = []
+    needs_human_review: bool
+    auto_fix_successful: bool
 
 
 # ============== Helper Functions ==============
@@ -433,6 +453,56 @@ Respond with ONLY valid JSON:
         raise HTTPException(
             status_code=500,
             detail=f"Failed to generate code: {str(e)}"
+        )
+
+
+@app.post("/validate-plan", response_model=ValidatePlanResponse)
+async def validate_terraform_plan(request: ValidatePlanRequest):
+    """
+    Validate Terraform plan output and automatically fix issues
+    
+    This endpoint:
+    1. Analyzes terraform plan output for errors
+    2. Uses AI to understand root causes
+    3. Automatically applies fixes where possible
+    4. Returns fixed code or suggests manual fixes
+    """
+    try:
+        logger.info(f"Validating Terraform plan for deployment: {request.deployment_id}")
+        
+        # Run validation
+        result = plan_validator.validate_and_fix(
+            plan_output=request.plan_output,
+            terraform_code=request.terraform_code
+        )
+        
+        # Determine if auto-fix was successful
+        auto_fix_successful = (
+            result['has_errors'] and 
+            len(result['fixes_applied']) > 0 and
+            not result['needs_human_review']
+        )
+        
+        logger.info(f"Validation complete. Errors: {result['has_errors']}, " +
+                   f"Fixes applied: {len(result['fixes_applied'])}, " +
+                   f"Needs review: {result['needs_human_review']}")
+        
+        return ValidatePlanResponse(
+            has_errors=result['has_errors'],
+            errors=result['errors'],
+            fixes_applied=result['fixes_applied'],
+            fixed_code=result['fixed_code'],
+            analysis=result['analysis'],
+            suggestions=result.get('suggestions', []),
+            needs_human_review=result['needs_human_review'],
+            auto_fix_successful=auto_fix_successful
+        )
+        
+    except Exception as e:
+        logger.error(f"Plan validation failed: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to validate plan: {str(e)}"
         )
 
 
