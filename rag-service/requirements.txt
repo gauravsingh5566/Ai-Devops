@@ -5,12 +5,8 @@
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 
-# Local Embeddings - COMPATIBLE VERSIONS
+# Local Embeddings - sentence-transformers will install compatible torch
 sentence-transformers==2.7.0
-transformers==4.40.0
-torch==2.2.0
-tokenizers==0.19.1
-numpy==1.26.0
 
 # Vector Database - Qdrant
 qdrant-client==1.7.0
@@ -20,7 +16,7 @@ pydantic==2.5.0
 pydantic-settings==2.1.0
 
 # HTTP Client
-httpx==0.25.2
+httpx[http2]==0.25.2
 
 # Utilities
 python-dotenv==1.0.0

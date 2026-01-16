@@ -14,6 +14,9 @@ import os
 import logging
 from datetime import datetime
 import hashlib
+from terraform_store import create_terraform_store
+from template_store import create_template_store
+from infra_templates import INFRASTRUCTURE_TEMPLATES, get_template_text_for_embedding
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -65,6 +68,30 @@ except Exception as e:
     logger.error(f"Failed to load embedding model: {e}")
     embedding_model = None
 
+# Initialize Terraform code store
+terraform_store = None
+if qdrant_client and embedding_model:
+    try:
+        terraform_store = create_terraform_store(qdrant_client, embedding_model)
+        logger.info("✅ Terraform code store initialized")
+    except Exception as e:
+        logger.error(f"Failed to initialize Terraform store: {e}")
+
+# Initialize Infrastructure Template store
+template_store = None
+if qdrant_client and embedding_model:
+    try:
+        template_store = create_template_store(qdrant_client, embedding_model)
+        logger.info("✅ Infrastructure template store initialized")
+        
+        # Load pre-defined templates on startup
+        logger.info("Loading pre-defined infrastructure templates...")
+        for template in INFRASTRUCTURE_TEMPLATES:
+            template_store.store_template(template)
+        logger.info(f"✅ Loaded {len(INFRASTRUCTURE_TEMPLATES)} infrastructure templates")
+    except Exception as e:
+        logger.error(f"Failed to initialize template store: {e}")
+
 
 # ============== Pydantic Models ==============
 
@@ -93,6 +120,43 @@ class CachedIntentResult(BaseModel):
 class StoreIntentRequest(BaseModel):
     user_request: str
     intent: Dict[str, Any]
+
+class StoreTerraformRequest(BaseModel):
+    terraform_code: str
+    deployment_id: str
+    resource_types: List[str]
+    description: str
+    metadata: Optional[Dict[str, Any]] = {}
+
+class SearchTerraformRequest(BaseModel):
+    error_description: str
+    failed_code: str
+    resource_types: List[str]
+    top_k: int = Field(default=3, ge=1, le=10)
+
+class TerraformExample(BaseModel):
+    terraform_code: str
+    description: str
+    resource_types: List[str]
+    similarity_score: Optional[float] = None
+    deployment_id: str
+    metadata: Dict[str, Any] = {}
+
+class SearchTemplateRequest(BaseModel):
+    user_requirement: str
+    top_k: int = Field(default=3, ge=1, le=5)
+
+class InfrastructureTemplate(BaseModel):
+    template_id: str
+    name: str
+    description: str
+    use_case: str
+    components: List[str]
+    services: Dict[str, List[str]]
+    estimated_cost: str
+    complexity: str
+    tags: List[str]
+    similarity_score: Optional[float] = None
 
 
 # ============== Helper Functions ==============
@@ -273,6 +337,135 @@ async def get_cache_stats():
     except Exception as e:
         logger.error(f"Failed to get stats: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/terraform/store")
+async def store_terraform_example(request: StoreTerraformRequest):
+    """
+    Store successful Terraform deployment for future reference
+    """
+    if not terraform_store:
+        raise HTTPException(status_code=503, detail="Terraform store not available")
+    
+    try:
+        success = terraform_store.store_successful_terraform(
+            terraform_code=request.terraform_code,
+            deployment_id=request.deployment_id,
+            resource_types=request.resource_types,
+            description=request.description,
+            metadata=request.metadata
+        )
+        
+        if success:
+            return {
+                "status": "stored",
+                "deployment_id": request.deployment_id,
+                "message": "Terraform code stored successfully"
+            }
+        else:
+            raise HTTPException(status_code=500, detail="Failed to store Terraform code")
+            
+    except Exception as e:
+        logger.error(f"Error storing Terraform: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/terraform/search", response_model=List[TerraformExample])
+async def search_terraform_examples(request: SearchTerraformRequest):
+    """
+    Search for similar working Terraform examples to help fix errors
+    """
+    if not terraform_store:
+        raise HTTPException(status_code=503, detail="Terraform store not available")
+    
+    try:
+        examples = terraform_store.search_similar_terraform(
+            error_description=request.error_description,
+            failed_code=request.failed_code,
+            resource_types=request.resource_types,
+            top_k=request.top_k
+        )
+        
+        return examples
+        
+    except Exception as e:
+        logger.error(f"Error searching Terraform: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/terraform/stats")
+async def get_terraform_stats():
+    """Get statistics about stored Terraform examples"""
+    if not terraform_store:
+        raise HTTPException(status_code=503, detail="Terraform store not available")
+    
+    try:
+        collection_info = qdrant_client.get_collection("terraform_examples")
+        return {
+            "total_examples": collection_info.points_count,
+            "status": "active"
+        }
+    except Exception as e:
+        return {
+            "total_examples": 0,
+            "status": "empty or not initialized"
+        }
+
+
+@app.post("/templates/search", response_model=List[InfrastructureTemplate])
+async def search_infrastructure_templates(request: SearchTemplateRequest):
+    """
+    Search for matching infrastructure templates based on user requirements
+    """
+    if not template_store:
+        raise HTTPException(status_code=503, detail="Template store not available")
+    
+    try:
+        templates = template_store.search_templates(
+            user_requirement=request.user_requirement,
+            top_k=request.top_k
+        )
+        
+        return templates
+        
+    except Exception as e:
+        logger.error(f"Error searching templates: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/templates/all", response_model=List[Dict])
+async def get_all_templates():
+    """Get all available infrastructure templates"""
+    if not template_store:
+        raise HTTPException(status_code=503, detail="Template store not available")
+    
+    try:
+        templates = template_store.get_all_templates()
+        return templates
+    except Exception as e:
+        logger.error(f"Error getting templates: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/templates/stats")
+async def get_template_stats():
+    """Get template collection statistics"""
+    if not template_store:
+        raise HTTPException(status_code=503, detail="Template store not available")
+    
+    try:
+        collection_info = qdrant_client.get_collection("infrastructure_templates")
+        return {
+            "total_templates": collection_info.points_count,
+            "predefined_templates": len(INFRASTRUCTURE_TEMPLATES),
+            "status": "active"
+        }
+    except Exception as e:
+        return {
+            "total_templates": 0,
+            "predefined_templates": len(INFRASTRUCTURE_TEMPLATES),
+            "status": "not initialized"
+        }
 
 
 @app.get("/health")

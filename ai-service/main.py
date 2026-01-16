@@ -12,9 +12,11 @@ import httpx
 import os
 import json
 import re
+import hashlib
 import logging
 from datetime import datetime
 from plan_validator import create_plan_validator
+from rag_client import create_rag_client
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -48,12 +50,15 @@ else:
 # Using gemini-2.5-flash-lite for text generation (working, free tier)
 model = genai.GenerativeModel('gemini-2.5-flash-lite')
 
-# Initialize Plan Validator
-plan_validator = create_plan_validator(model)
-logger.info("Terraform Plan Validator initialized")
-
 # RAG Service URL
 RAG_SERVICE_URL = os.getenv("RAG_SERVICE_URL", "http://rag-service:8002")
+
+# Create RAG client for Terraform examples
+rag_client = create_rag_client(RAG_SERVICE_URL)
+
+# Initialize Plan Validator with RAG connection
+plan_validator = create_plan_validator(model, terraform_store=rag_client)
+logger.info("Terraform Plan Validator initialized with RAG connection")
 
 
 # ============== Pydantic Models ==============
@@ -66,6 +71,8 @@ class ParseIntentResponse(BaseModel):
     intent: Dict[str, Any]
     message: str
     cached: bool = False
+    user_request: Optional[str] = None  # Original user message
+    matching_templates: Optional[List[Dict]] = []  # Matching infrastructure templates
 
 class GenerateCodeRequest(BaseModel):
     intent: Dict[str, Any]
@@ -94,6 +101,63 @@ class ValidatePlanResponse(BaseModel):
 
 
 # ============== Helper Functions ==============
+
+async def store_generated_terraform(
+    terraform_code: str,
+    intent: Dict[str, Any],
+    resources: List[str],
+    user_request: str
+):
+    """
+    Store generated Terraform code in RAG service immediately after generation
+    """
+    try:
+        # Extract resource types
+        resource_pattern = r'resource\s+"(aws_\w+)"\s+"(\w+)"'
+        resource_types = list(set([m[0] for m in re.findall(resource_pattern, terraform_code)]))
+        
+        if not resource_types:
+            resource_types = [r.split('.')[0] for r in resources if '.' in r]
+        
+        # Generate unique ID
+        code_hash = hashlib.sha256(terraform_code.encode()).hexdigest()[:16]
+        deployment_id = f"gen_{code_hash}"
+        
+        # Create description from intent (handle missing keys)
+        description = intent.get('summary', intent.get('description', user_request[:200]))
+        if not description or description == user_request[:200]:
+            # Fallback: create description from resources
+            description = f"Infrastructure with {', '.join(resource_types[:3])}"
+        
+        logger.info(f"Storing generated Terraform: {deployment_id}")
+        
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.post(
+                f"{RAG_SERVICE_URL}/terraform/store",
+                json={
+                    "terraform_code": terraform_code,
+                    "deployment_id": deployment_id,
+                    "resource_types": resource_types,
+                    "description": description,
+                    "metadata": {
+                        "source": "ai_generation",
+                        "intent": intent,
+                        "timestamp": datetime.now().isoformat()
+                    }
+                }
+            )
+            
+            if response.status_code == 200:
+                logger.info(f"✅ Stored generated Terraform in Qdrant: {deployment_id}")
+                return True
+            else:
+                logger.warning(f"Failed to store in RAG: {response.status_code}")
+                return False
+                
+    except Exception as e:
+        logger.warning(f"Could not store generated Terraform: {e}")
+        return False
+
 
 def extract_json_from_text(text: str) -> dict:
     """Extract JSON from Gemini response that might contain markdown"""
@@ -269,32 +333,99 @@ async def parse_intent(request: ParseIntentRequest):
         # Check cache first
         cached_intent = await check_intent_cache(request.message)
         if cached_intent:
+            cached_intent['user_request'] = request.message
+            
+            # Search templates even for cached intents
+            matching_templates = []
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    template_response = await client.post(
+                        f"{RAG_SERVICE_URL}/templates/search",
+                        json={
+                            "user_requirement": request.message,
+                            "top_k": 3
+                        }
+                    )
+                    if template_response.status_code == 200:
+                        matching_templates = template_response.json()
+            except Exception as e:
+                logger.warning(f"Could not fetch templates: {e}")
+            
             return ParseIntentResponse(
                 intent=cached_intent,
                 message="Intent retrieved from cache",
-                cached=True
+                cached=True,
+                user_request=request.message,
+                matching_templates=matching_templates
             )
         
-        # Create prompt for Gemini
+        # Search for matching templates FIRST (before calling Gemini)
+        matching_templates = []
+        template_context = ""
+        try:
+            logger.info(f"Searching infrastructure templates for: {request.message[:100]}")
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                template_response = await client.post(
+                    f"{RAG_SERVICE_URL}/templates/search",
+                    json={
+                        "user_requirement": request.message,
+                        "top_k": 2
+                    }
+                )
+                
+                if template_response.status_code == 200:
+                    matching_templates = template_response.json()
+                    if matching_templates:
+                        logger.info(f"✅ Found {len(matching_templates)} matching templates")
+                        
+                        # Build template context for AI prompt
+                        template_context = "\n\nMATCHING INFRASTRUCTURE TEMPLATES:\n"
+                        for idx, template in enumerate(matching_templates, 1):
+                            logger.info(f"  • {template['name']} (Match: {template.get('similarity_score', 0):.0%})")
+                            template_context += f"\nTemplate {idx}: {template['name']} (Match: {template.get('similarity_score', 0):.0%})\n"
+                            template_context += f"Recommended AWS Resources:\n"
+                            
+                            # Add services from template
+                            services = template.get('services', {})
+                            for category, service_list in services.items():
+                                template_context += f"  {category}: {', '.join(service_list)}\n"
+                            
+                            template_context += f"Components: {', '.join(template.get('components', [])[:5])}\n"
+                    else:
+                        logger.info("No matching templates found")
+        except Exception as e:
+            logger.warning(f"Could not fetch templates: {e}")
+        
+        # Create prompt for Gemini with template recommendations
         prompt = f"""You are an AWS infrastructure expert. Parse this natural language request into a structured JSON intent.
 
 User Request: {request.message}
+{template_context}
+
+IMPORTANT: If matching templates are provided above, use their recommended services and resources in your response.
 
 Extract the following information:
-1. resources: List of AWS resources needed (e.g., vpc, subnet, ec2, rds, s3)
+1. resources: List of AWS resources needed based on templates (e.g., vpc, subnet, ecs, rds, elasticache, alb)
+   - If templates suggest ECS Fargate, include: ecs, ecs_service, ecs_task_definition
+   - If templates suggest RDS, include: rds
+   - If templates suggest Load Balancer, include: alb, target_group
+   - If templates suggest ElastiCache, include: elasticache
+   - Include ALL resources mentioned in the matching template services
 2. region: AWS region (default: us-east-1)
 3. environment: Environment type (dev, staging, production)
-4. requirements: Specific requirements mentioned
+4. requirements: Specific requirements mentioned by user
 5. constraints: Any limitations or constraints
+6. recommended_template: If templates match well (>50%), include the template_id of best match
 
 Respond with ONLY valid JSON in this exact format:
 {{
-  "resources": ["list", "of", "resources"],
+  "resources": ["vpc", "subnet", "ecs", "ecs_service", "alb", "target_group", "rds", "elasticache", "security_group"],
   "region": "us-east-1",
   "environment": "production",
   "requirements": ["requirement1", "requirement2"],
   "constraints": ["constraint1"],
-  "summary": "Brief summary of what to create"
+  "summary": "Brief summary of what to create",
+  "recommended_template": "microservices-arch"
 }}"""
 
         # Call Gemini
@@ -306,13 +437,22 @@ Respond with ONLY valid JSON in this exact format:
         
         logger.info(f"Intent parsed successfully: {intent_data.get('summary', 'N/A')}")
         
+        # Templates already fetched above, just log count
+        if matching_templates:
+            logger.info(f"Returning {len(matching_templates)} matching templates with intent")
+        
         # Cache the result (non-blocking)
         await store_intent_cache(request.message, intent_data)
+        
+        # Add original user request to intent
+        intent_data['user_request'] = request.message
         
         return ParseIntentResponse(
             intent=intent_data,
             message="Intent parsed successfully using Gemini",
-            cached=False
+            cached=False,
+            user_request=request.message,
+            matching_templates=matching_templates
         )
         
     except Exception as e:
@@ -332,12 +472,62 @@ async def generate_code(request: GenerateCodeRequest):
         intent = request.intent
         best_practices = request.best_practices or []
         
+        # NEW: Search for matching infrastructure templates
+        template_context = ""
+        try:
+            # Get user request from intent
+            user_req = intent.get('user_request', '') or intent.get('summary', '')
+            
+            if user_req:
+                logger.info(f"Searching templates for: {user_req[:100]}")
+                
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    response = await client.post(
+                        f"{RAG_SERVICE_URL}/templates/search",
+                        json={
+                            "user_requirement": user_req,
+                            "top_k": 2
+                        }
+                    )
+                    
+                    if response.status_code == 200:
+                        templates = response.json()
+                        if templates:
+                            template_context = "\n\n🎯 MATCHING INFRASTRUCTURE TEMPLATES FROM DATABASE:\n"
+                            for idx, template in enumerate(templates, 1):
+                                template_context += f"\n--- Template {idx}: {template['name']} (Match: {template.get('similarity_score', 0):.0%}) ---\n"
+                                template_context += f"Use Case: {template['use_case']}\n"
+                                template_context += f"Recommended Components:\n"
+                                for comp in template['components'][:8]:  # Top 8 components
+                                    template_context += f"  • {comp}\n"
+                                
+                                # Show services by category
+                                services = template.get('services', {})
+                                if services:
+                                    template_context += f"Services to Use:\n"
+                                    for category, service_list in list(services.items())[:3]:
+                                        template_context += f"  {category}: {', '.join(service_list[:3])}\n"
+                                
+                                template_context += f"Estimated Cost: {template['estimated_cost']}\n"
+                            
+                            logger.info(f"✅ Found {len(templates)} matching templates for code generation")
+                        else:
+                            logger.info("No matching templates found")
+            else:
+                logger.warning("No user_request found in intent for template search")
+                
+        except Exception as e:
+            logger.warning(f"Could not fetch templates: {e}")
+        
         # Build context from best practices
         context = ""
         if best_practices:
             context = "\n\nAWS Best Practices:\n"
             for practice in best_practices[:3]:  # Use top 3
                 context += f"- {practice.get('content', '')}\n"
+        
+        # Add template context to prompt
+        context += template_context
         
         # Create comprehensive prompt
         prompt = f"""You are a Terraform expert. Generate production-ready Terraform code based on this intent.
@@ -440,6 +630,20 @@ Respond with ONLY valid JSON:
                 logger.info("Auto-fix successful!")
         
         logger.info("Code generated successfully")
+        
+        # Store generated Terraform in RAG (don't wait for deployment)
+        try:
+            # Get user request from intent or use summary
+            user_req = intent.get('summary', 'Generated Infrastructure')
+            
+            await store_generated_terraform(
+                terraform_code=code_data.get('terraform_code', ''),
+                intent=intent,
+                resources=code_data.get('resources', []),
+                user_request=user_req
+            )
+        except Exception as e:
+            logger.warning(f"Failed to store generated code: {e}")
         
         return GenerateCodeResponse(
             terraform_code=code_data.get('terraform_code', ''),

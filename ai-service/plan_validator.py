@@ -17,8 +17,9 @@ class TerraformPlanValidator:
     Analyzes plan output and suggests/applies fixes
     """
     
-    def __init__(self, gemini_model):
+    def __init__(self, gemini_model, terraform_store=None):
         self.model = gemini_model
+        self.terraform_store = terraform_store  # Can be None if RAG not available
         self.common_errors = {
             'missing_required_argument': self._fix_missing_argument,
             'invalid_value': self._fix_invalid_value,
@@ -141,11 +142,35 @@ class TerraformPlanValidator:
             return 'unknown'
     
     def _ai_analyze_errors(self, plan_output: str, terraform_code: str, errors: List[Dict]) -> Dict:
-        """Use Gemini AI to analyze errors and suggest fixes"""
+        """Use Gemini AI to analyze errors and suggest fixes using reference examples"""
         
-        prompt = f"""You are a Terraform AWS expert. Analyze these errors and generate EXACT code fixes.
+        # Extract resource types from errors
+        resource_types = self._extract_resource_types(terraform_code, errors)
+        
+        # Search for similar working examples (if available)
+        reference_examples = ""
+        if hasattr(self, 'terraform_store'):
+            try:
+                error_desc = " | ".join([e.get('message', '')[:100] for e in errors])
+                similar_examples = self.terraform_store.search_similar_terraform(
+                    error_description=error_desc,
+                    failed_code=terraform_code,
+                    resource_types=resource_types,
+                    top_k=2
+                )
+                
+                if similar_examples:
+                    reference_examples = "\n\nWORKING REFERENCE EXAMPLES FROM DATABASE:\n"
+                    for idx, example in enumerate(similar_examples, 1):
+                        reference_examples += f"\n--- Example {idx} (Similarity: {example['similarity_score']:.2f}) ---\n"
+                        reference_examples += f"Description: {example['description']}\n"
+                        reference_examples += f"Code:\n```hcl\n{example['terraform_code'][:1000]}\n```\n"
+            except Exception as e:
+                logger.warning(f"Could not fetch reference examples: {e}")
+        
+        prompt = f"""You are a Terraform AWS expert. Generate a COMPLETE FIXED Terraform file.
 
-TERRAFORM CODE:
+FAILED TERRAFORM CODE:
 ```hcl
 {terraform_code[:4000]}  
 ```
@@ -157,6 +182,7 @@ TERRAFORM PLAN ERRORS:
 
 DETECTED ERRORS:
 {json.dumps(errors, indent=2)}
+{reference_examples}
 
 CRITICAL AWS TERRAFORM RULES:
 
@@ -166,43 +192,59 @@ CRITICAL AWS TERRAFORM RULES:
    - CORRECT: Use "noncurrent_days" inside "noncurrent_version_expiration" block
    - CORRECT: Use "newer_noncurrent_versions" instead of "newer_versions"
 
-2. Missing required arguments:
+2. aws_autoscaling_group tags:
+   - NEVER use: tags = {{...}} or tags = [...]
+   - CORRECT: Use tag blocks like this:
+      tag {{
+        key                 = "Name"
+        value               = "my-instance"
+        propagate_at_launch = true
+      }}
+
+3. aws_launch_template tags:
+   - Use: tags = {{...}} (normal syntax)
+   - NOT: tags {{...}} (block syntax)
+
+4. Missing required arguments:
    - Add with sensible defaults
    - Example: description = "Managed by Terraform"
 
-3. Deprecated attributes:
-   - Replace with current equivalents
-   - Check AWS provider docs
+5. Always check reference examples above for correct patterns
+
+6. CRITICAL: Do NOT include provider or terraform blocks!
+   - NO provider "aws" blocks
+   - NO terraform blocks
+   - ONLY resource and data blocks
 
 YOUR TASK:
-For EACH error, provide:
-1. The EXACT line(s) that need to change
-2. The EXACT replacement code
-3. Mark as auto_fixable=true if you can generate the exact fix
+1. Analyze EACH error carefully
+2. Look at reference examples (if provided) to understand correct patterns
+3. Generate a COMPLETE FIXED Terraform file with ALL errors resolved
+4. Include the ENTIRE working code, not just snippets
+5. DO NOT include provider "aws" or terraform blocks (they already exist)
 
-RESPOND WITH ONLY THIS JSON (no markdown, no explanation):
+RESPOND WITH ONLY THIS JSON (no markdown):
 {{
-    "analysis": "Brief summary of all errors",
+    "analysis": "Summary of all errors and fixes applied",
     "errors_analyzed": [
         {{
             "error_type": "missing_required_argument",
             "resource": "aws_s3_bucket.example",
-            "line_number": 10,
             "root_cause": "Specific reason",
-            "current_code": "exact current problematic code",
-            "fixed_code": "exact corrected code to replace it with",
+            "current_code": "exact current problematic code line",
+            "fixed_code": "exact corrected code line",
             "priority": "critical",
             "auto_fixable": true
         }}
     ],
+    "complete_fixed_terraform": "ENTIRE fixed Terraform code WITHOUT provider blocks",
     "suggestions": ["Additional tips"],
     "requires_human_review": false
 }}
 
-IMPORTANT:
-- Make auto_fixable=true ONLY if you provide exact current_code and fixed_code
-- For S3 lifecycle errors, MUST use correct attribute names
-- Be SPECIFIC with line numbers and code snippets
+CRITICAL: 
+- The "complete_fixed_terraform" field MUST contain the ENTIRE working Terraform file
+- DO NOT include provider or terraform blocks - only resources!
 """
 
         try:
@@ -218,6 +260,25 @@ IMPORTANT:
                 'suggestions': ['Manual review required'],
                 'requires_human_review': True
             }
+    
+    def _extract_resource_types(self, terraform_code: str, errors: List[Dict]) -> List[str]:
+        """Extract AWS resource types from code and errors"""
+        import re
+        resources = set()
+        
+        # Extract from code
+        pattern = r'resource\s+"(aws_\w+)"\s+"(\w+)"'
+        matches = re.findall(pattern, terraform_code)
+        for match in matches:
+            resources.add(match[0])
+        
+        # Extract from error messages
+        for error in errors:
+            msg = error.get('message', '')
+            aws_resources = re.findall(r'(aws_\w+)', msg)
+            resources.update(aws_resources)
+        
+        return list(resources)
     
     def _extract_json_from_text(self, text: str) -> Dict:
         """Extract JSON from AI response"""
@@ -246,9 +307,26 @@ IMPORTANT:
     
     def _apply_fixes(self, terraform_code: str, errors: List[Dict], ai_analysis: Dict) -> Tuple[str, List[str]]:
         """Apply automatic fixes to terraform code"""
-        fixed_code = terraform_code
         fixes_applied = []
         
+        # PRIORITY 1: Use complete fixed Terraform if AI provided it
+        complete_fixed = ai_analysis.get('complete_fixed_terraform', '').strip()
+        if complete_fixed and len(complete_fixed) > 100:
+            logger.info("✅ AI generated COMPLETE fixed Terraform file")
+            # Build descriptive fixes list
+            error_types = list(set([e.get('type', 'unknown') for e in errors]))
+            fixes_applied.append(f"AI regenerated complete Terraform file")
+            fixes_applied.append(f"Fixed {len(errors)} error(s): {', '.join(error_types[:3])}")
+            
+            # Add specific fixes if available
+            for error_info in ai_analysis.get('errors_analyzed', []):
+                if error_info.get('root_cause'):
+                    fixes_applied.append(f"• {error_info.get('root_cause', '')[:100]}")
+            
+            return complete_fixed, fixes_applied
+        
+        # PRIORITY 2: Apply individual fixes
+        fixed_code = terraform_code
         errors_analyzed = ai_analysis.get('errors_analyzed', [])
         
         for error_analysis in errors_analyzed:
@@ -272,13 +350,42 @@ IMPORTANT:
             error_type = error_analysis.get('error_type')
             fix_description = error_analysis.get('fix', '') or error_analysis.get('root_cause', '')
             
-            # Common pattern fixes
-            if 'noncurrent_versions_days' in terraform_code or 'newer_versions' in terraform_code:
+            # Common pattern fixes for S3
+            if 'noncurrent_versions_days' in fixed_code or 'newer_versions' in fixed_code:
                 # Fix S3 lifecycle configuration
                 fixed_code = fixed_code.replace('noncurrent_versions_days', 'noncurrent_days')
                 fixed_code = fixed_code.replace('newer_versions', 'newer_noncurrent_versions')
                 fixes_applied.append("Fixed S3 lifecycle configuration attributes")
                 logger.info("Applied S3 lifecycle fix")
+            
+            # Fix Auto Scaling Group tags syntax
+            if 'aws_autoscaling_group' in fixed_code:
+                # Convert tags = {...} to tag blocks
+                import re
+                
+                # Pattern: tags = { ... } or tags = [ ... ]
+                asg_pattern = r'(resource\s+"aws_autoscaling_group"[^}]+?)tags\s*=\s*[\{\[]([^\}\]]+)[\}\]]'
+                
+                def convert_asg_tags(match):
+                    resource_part = match.group(1)
+                    tags_content = match.group(2)
+                    
+                    # Parse tags
+                    tag_blocks = []
+                    tag_matches = re.findall(r'(\w+)\s*=\s*"([^"]+)"', tags_content)
+                    
+                    for key, value in tag_matches:
+                        tag_blocks.append(f'''  tag {{
+    key                 = "{key}"
+    value               = "{value}"
+    propagate_at_launch = true
+  }}''')
+                    
+                    return resource_part + '\n'.join(tag_blocks)
+                
+                fixed_code = re.sub(asg_pattern, convert_asg_tags, fixed_code, flags=re.DOTALL)
+                fixes_applied.append("Fixed Auto Scaling Group tags syntax")
+                logger.info("Applied ASG tags fix")
             
             # Apply fix based on type
             if error_type in self.common_errors:
@@ -368,6 +475,6 @@ IMPORTANT:
         return False
 
 
-def create_plan_validator(gemini_model):
+def create_plan_validator(gemini_model, terraform_store=None):
     """Factory function to create validator"""
-    return TerraformPlanValidator(gemini_model)
+    return TerraformPlanValidator(gemini_model, terraform_store)

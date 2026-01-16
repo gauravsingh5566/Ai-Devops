@@ -137,6 +137,9 @@ WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
 # AI Service URL for plan validation
 AI_SERVICE_URL = os.getenv("AI_SERVICE_URL", "http://ai-service:8001")
 
+# RAG Service URL for Terraform storage
+RAG_SERVICE_URL = os.getenv("RAG_SERVICE_URL", "http://rag-service:8002")
+
 # In-memory deployment tracking (use database in production)
 deployments_db = {}
 deployment_counter = 0
@@ -373,6 +376,45 @@ provider "aws" {{
     logger.info("Terraform files created successfully")
 
 
+def strip_provider_blocks(terraform_code: str) -> str:
+    """
+    Remove provider and terraform blocks from generated code
+    These blocks cause duplicate provider errors since provider.tf exists
+    """
+    import re
+    
+    # Remove provider "aws" blocks
+    terraform_code = re.sub(
+        r'provider\s+"aws"\s*\{[^}]*\}',
+        '',
+        terraform_code,
+        flags=re.DOTALL
+    )
+    
+    # Remove terraform blocks
+    terraform_code = re.sub(
+        r'terraform\s*\{[^}]*\}',
+        '',
+        terraform_code,
+        flags=re.DOTALL
+    )
+    
+    # Remove required_providers blocks
+    terraform_code = re.sub(
+        r'required_providers\s*\{[^}]*\}',
+        '',
+        terraform_code,
+        flags=re.DOTALL
+    )
+    
+    # Clean up extra newlines
+    terraform_code = re.sub(r'\n{3,}', '\n\n', terraform_code)
+    
+    logger.info("Stripped provider/terraform blocks from AI-generated code")
+    
+    return terraform_code.strip()
+
+
 def parse_terraform_plan(plan_output: str) -> Dict[str, int]:
     """Parse Terraform plan output to count resources"""
     import re
@@ -458,6 +500,40 @@ async def validate_plan_with_ai(plan_output: str, terraform_code: str, deploymen
             'needs_human_review': True,
             'analysis': f'AI validation failed: {str(e)}'
         }
+
+
+async def store_successful_terraform(deployment_id: str, terraform_code: str, description: str, resource_types: List[str]):
+    """
+    Store successful Terraform deployment in RAG service for future reference
+    """
+    try:
+        logger.info(f"Storing successful Terraform for {deployment_id}")
+        
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                f"{RAG_SERVICE_URL}/terraform/store",
+                json={
+                    "terraform_code": terraform_code,
+                    "deployment_id": deployment_id,
+                    "resource_types": resource_types,
+                    "description": description,
+                    "metadata": {
+                        "timestamp": datetime.now().isoformat(),
+                        "status": "successful"
+                    }
+                }
+            )
+            
+            if response.status_code == 200:
+                logger.info(f"Successfully stored Terraform example: {deployment_id}")
+                return True
+            else:
+                logger.warning(f"Failed to store Terraform: {response.status_code}")
+                return False
+                
+    except Exception as e:
+        logger.warning(f"Could not store Terraform example: {e}")
+        return False
 
 
 # ============== API Endpoints ==============
@@ -679,45 +755,166 @@ async def terraform_plan(deployment_id: str):
             
             deployment["terraform_output"] += f"\n=== AI VALIDATION ===\n{validation_result.get('analysis', '')}\n"
             
-            # Check if AI fixed the issues
-            if validation_result.get('auto_fix_successful'):
-                logger.info(f"AI auto-fix successful! Applying fixes and retrying plan...")
+            # Check if AI provided fixed code
+            fixed_code = validation_result.get('fixed_code', '').strip()
+            has_fixes = len(validation_result.get('fixes_applied', [])) > 0
+            
+            if fixed_code and len(fixed_code) > 100 and has_fixes:
+                logger.info(f"AI provided fixed code! Replacing and retrying plan...")
                 
-                # Write fixed code
-                fixed_code = validation_result['fixed_code']
+                # Strip provider blocks (infra service already creates provider.tf)
+                fixed_code = strip_provider_blocks(fixed_code)
+                
+                # COMPLETELY REPLACE the main.tf with AI-generated fixed code
                 main_tf.write_text(fixed_code)
                 
-                deployment["terraform_output"] += f"\n=== FIXES APPLIED ===\n"
+                deployment["terraform_output"] += f"\n=== AI FIXES APPLIED ===\n"
                 for fix in validation_result['fixes_applied']:
                     deployment["terraform_output"] += f"✓ {fix}\n"
                 
-                # Retry terraform plan with fixed code
+                deployment["terraform_output"] += f"\n💡 AI generated complete new Terraform file using references from Qdrant\n"
+                
+                # Retry terraform plan with AI-generated code
+                logger.info("Retrying terraform plan with AI-generated code...")
                 success_retry, stdout_retry, stderr_retry = run_terraform_command(
                     workspace_path,
                     ["terraform", "plan", "-out=tfplan", "-no-color"]
                 )
                 
-                deployment["terraform_output"] += f"\n=== RETRY PLAN ===\n{stdout_retry}\n{stderr_retry}\n"
+                deployment["terraform_output"] += f"\n=== RETRY PLAN (AI-GENERATED CODE) ===\n{stdout_retry}\n{stderr_retry}\n"
                 
                 if success_retry:
                     counts = parse_terraform_plan(stdout_retry)
                     
                     deployment["status"] = "planned"
-                    deployment["current_step"] = "plan complete (auto-fixed)"
+                    deployment["current_step"] = "plan complete (AI-regenerated)"
                     deployment["progress_percentage"] = 50
                     deployment["updated_at"] = datetime.now().isoformat()
                     deployment["ai_fixes_applied"] = validation_result['fixes_applied']
                     
                     return TerraformPlanResponse(
                         deployment_id=deployment_id,
-                        plan_output=f"AI Auto-Fix Applied:\n" + "\n".join(validation_result['fixes_applied']) + f"\n\n{stdout_retry}",
+                        plan_output=f"🤖 AI Auto-Fix Applied (Complete Regeneration):\n" + "\n".join(validation_result['fixes_applied']) + f"\n\n{stdout_retry}",
                         resources_to_add=counts["add"],
                         resources_to_change=counts["change"],
                         resources_to_destroy=counts["destroy"],
                         plan_file_path=str(plan_file)
                     )
                 else:
-                    # Still failed after fix
+                    # First retry failed - Try ONE MORE TIME with additional error context
+                    logger.warning("First AI fix failed. Trying again with error context...")
+                    
+                    # Call AI validator again with the NEW errors
+                    validation_result_2 = await validate_plan_with_ai(
+                        plan_output=f"{stdout_retry}\n{stderr_retry}",
+                        terraform_code=fixed_code,
+                        deployment_id=deployment_id
+                    )
+                    
+                    fixed_code_2 = validation_result_2.get('fixed_code', '').strip()
+                    has_fixes_2 = len(validation_result_2.get('fixes_applied', [])) > 0
+                    
+                    if fixed_code_2 and len(fixed_code_2) > 100 and has_fixes_2:
+                        logger.info("AI provided second fix! Applying...")
+                        
+                        fixed_code_2 = strip_provider_blocks(fixed_code_2)
+                        main_tf.write_text(fixed_code_2)
+                        
+                        deployment["terraform_output"] += f"\n=== SECOND AI FIX ===\n"
+                        for fix in validation_result_2['fixes_applied']:
+                            deployment["terraform_output"] += f"✓ {fix}\n"
+                        
+                        # Final retry
+                        success_retry_2, stdout_retry_2, stderr_retry_2 = run_terraform_command(
+                            workspace_path,
+                            ["terraform", "plan", "-out=tfplan", "-no-color"]
+                        )
+                        
+                        deployment["terraform_output"] += f"\n=== FINAL RETRY ===\n{stdout_retry_2}\n{stderr_retry_2}\n"
+                        
+                        if success_retry_2:
+                            counts = parse_terraform_plan(stdout_retry_2)
+                            
+                            deployment["status"] = "planned"
+                            deployment["current_step"] = "plan complete (AI-regenerated x2)"
+                            deployment["progress_percentage"] = 50
+                            deployment["updated_at"] = datetime.now().isoformat()
+                            deployment["ai_fixes_applied"] = validation_result['fixes_applied'] + validation_result_2['fixes_applied']
+                            
+                            return TerraformPlanResponse(
+                                deployment_id=deployment_id,
+                                plan_output=f"🤖 AI Auto-Fix Applied (2 iterations):\n" + "\n".join(validation_result['fixes_applied'] + validation_result_2['fixes_applied']) + f"\n\n{stdout_retry_2}",
+                                resources_to_add=counts["add"],
+                                resources_to_change=counts["change"],
+                                resources_to_destroy=counts["destroy"],
+                                plan_file_path=str(plan_file)
+                            )
+                        else:
+                            # Second retry also failed - Try THIRD AND FINAL TIME
+                            logger.warning("Second AI fix failed. Final attempt with full error history...")
+                            
+                            # Build complete error history
+                            error_history = f"""
+ATTEMPT 1 ERROR:
+{stderr}
+
+ATTEMPT 2 ERROR (after first fix):
+{stderr_retry}
+
+ATTEMPT 3 ERROR (after second fix):
+{stderr_retry_2}
+
+ALL PREVIOUS FIXES ATTEMPTED:
+{chr(10).join(validation_result['fixes_applied'] + validation_result_2['fixes_applied'])}
+"""
+                            
+                            validation_result_3 = await validate_plan_with_ai(
+                                plan_output=error_history,
+                                terraform_code=fixed_code_2,
+                                deployment_id=deployment_id
+                            )
+                            
+                            fixed_code_3 = validation_result_3.get('fixed_code', '').strip()
+                            has_fixes_3 = len(validation_result_3.get('fixes_applied', [])) > 0
+                            
+                            if fixed_code_3 and len(fixed_code_3) > 100 and has_fixes_3:
+                                logger.info("AI provided THIRD fix! Final attempt...")
+                                
+                                fixed_code_3 = strip_provider_blocks(fixed_code_3)
+                                main_tf.write_text(fixed_code_3)
+                                
+                                deployment["terraform_output"] += f"\n=== THIRD AI FIX (FINAL) ===\n"
+                                for fix in validation_result_3['fixes_applied']:
+                                    deployment["terraform_output"] += f"✓ {fix}\n"
+                                
+                                # FINAL retry
+                                success_retry_3, stdout_retry_3, stderr_retry_3 = run_terraform_command(
+                                    workspace_path,
+                                    ["terraform", "plan", "-out=tfplan", "-no-color"]
+                                )
+                                
+                                deployment["terraform_output"] += f"\n=== FINAL RETRY (ATTEMPT 3) ===\n{stdout_retry_3}\n{stderr_retry_3}\n"
+                                
+                                if success_retry_3:
+                                    counts = parse_terraform_plan(stdout_retry_3)
+                                    
+                                    deployment["status"] = "planned"
+                                    deployment["current_step"] = "plan complete (AI-regenerated x3)"
+                                    deployment["progress_percentage"] = 50
+                                    deployment["updated_at"] = datetime.now().isoformat()
+                                    all_fixes = validation_result['fixes_applied'] + validation_result_2['fixes_applied'] + validation_result_3['fixes_applied']
+                                    deployment["ai_fixes_applied"] = all_fixes
+                                    
+                                    return TerraformPlanResponse(
+                                        deployment_id=deployment_id,
+                                        plan_output=f"🤖 AI Auto-Fix Applied (3 iterations - RESOLVED!):\n" + "\n".join(all_fixes) + f"\n\n{stdout_retry_3}",
+                                        resources_to_add=counts["add"],
+                                        resources_to_change=counts["change"],
+                                        resources_to_destroy=counts["destroy"],
+                                        plan_file_path=str(plan_file)
+                                    )
+                    
+                    # Still failed after 3 tries - Give up
                     deployment["status"] = "failed"
                     deployment["error_message"] = f"Plan failed even after AI fixes: {stderr_retry}"
                     deployment["updated_at"] = datetime.now().isoformat()
@@ -811,6 +1008,23 @@ async def terraform_apply(deployment_id: str, auto_approve: bool = False):
             deployment["progress_percentage"] = 100
             deployment["resources_created"] = resources
             deployment["updated_at"] = datetime.now().isoformat()
+            
+            # Store successful Terraform in RAG for future reference
+            try:
+                main_tf_path = workspace_path / "main.tf"
+                if main_tf_path.exists():
+                    terraform_code = main_tf_path.read_text()
+                    
+                    # Extract resource types
+                    import re
+                    resource_pattern = r'resource\s+"(aws_\w+)"\s+"(\w+)"'
+                    resource_types = list(set([m[0] for m in re.findall(resource_pattern, terraform_code)]))
+                    
+                    # Store asynchronously (don't wait for completion)
+                    description = deployment.get("deployment_name", f"Deployment {deployment_id}")
+                    await store_successful_terraform(deployment_id, terraform_code, description, resource_types)
+            except Exception as e:
+                logger.warning(f"Could not store Terraform example: {e}")
             
             return {
                 "deployment_id": deployment_id,
