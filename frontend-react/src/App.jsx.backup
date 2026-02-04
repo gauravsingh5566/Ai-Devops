@@ -1,0 +1,427 @@
+import { useState, useEffect } from 'react';
+import { Toaster, toast } from 'react-hot-toast';
+import { 
+  Terminal, 
+  Rocket, 
+  CheckCircle2, 
+  XCircle, 
+  Loader2, 
+  Cloud,
+  Shield,
+  DollarSign,
+  Activity,
+  Zap,
+  Code,
+  Play,
+  Download,
+  RefreshCw,
+  ChevronDown,
+  ChevronUp,
+  AlertCircle,
+  Server
+} from 'lucide-react';
+import { aiService, ragService, mcpService, infraService, checkAllServices } from './services/api';
+import CodeEditor from './components/CodeEditor';
+import ValidationResults from './components/ValidationResults';
+import DeploymentProgress from './components/DeploymentProgress';
+import ServiceStatus from './components/ServiceStatus';
+
+const STEPS = {
+  INPUT: 0,
+  GENERATED: 1,
+  VALIDATED: 2,
+  DEPLOYED: 3,
+};
+
+function App() {
+  const [currentStep, setCurrentStep] = useState(STEPS.INPUT);
+  const [userInput, setUserInput] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [loadingMessage, setLoadingMessage] = useState('');
+  
+  // Data states
+  const [intent, setIntent] = useState(null);
+  const [ragContext, setRagContext] = useState(null);
+  const [terraformCode, setTerraformCode] = useState('');
+  const [explanation, setExplanation] = useState('');
+  const [resources, setResources] = useState([]);
+  const [costInfo, setCostInfo] = useState('');
+  
+  const [validationResult, setValidationResult] = useState(null);
+  const [deploymentData, setDeploymentData] = useState(null);
+  const [deploymentName, setDeploymentName] = useState('');
+  const [confirmDeploy, setConfirmDeploy] = useState(false);
+  
+  // UI states
+  const [expandedSections, setExpandedSections] = useState({
+    intent: false,
+    ragContext: false,
+    costBreakdown: false,
+    securityDetails: false,
+    recommendations: false,
+  });
+  const [serviceHealth, setServiceHealth] = useState([]);
+  const [showServiceStatus, setShowServiceStatus] = useState(false);
+
+  // Check service health on mount
+  useEffect(() => {
+    checkServices();
+    const interval = setInterval(checkServices, 30000); // Check every 30s
+    return () => clearInterval(interval);
+  }, []);
+
+  const checkServices = async () => {
+    try {
+      const health = await checkAllServices();
+      setServiceHealth(health);
+    } catch (error) {
+      console.error('Error checking services:', error);
+    }
+  };
+
+  const toggleSection = (section) => {
+    setExpandedSections((prev) => ({
+      ...prev,
+      [section]: !prev[section],
+    }));
+  };
+
+  const resetAll = () => {
+    setCurrentStep(STEPS.INPUT);
+    setUserInput('');
+    setIntent(null);
+    setRagContext(null);
+    setTerraformCode('');
+    setExplanation('');
+    setResources([]);
+    setCostInfo('');
+    setValidationResult(null);
+    setDeploymentData(null);
+    setDeploymentName('');
+    setConfirmDeploy(false);
+    setExpandedSections({
+      intent: false,
+      ragContext: false,
+      costBreakdown: false,
+      securityDetails: false,
+      recommendations: false,
+    });
+  };
+
+  const handleGenerate = async () => {
+    if (!userInput.trim()) {
+      toast.error('Please enter infrastructure requirements');
+      return;
+    }
+
+    setLoading(true);
+    try {
+      // Step 1: Parse intent
+      setLoadingMessage('🧠 Parsing your infrastructure requirements...');
+      const intentData = await aiService.parseIntent(userInput);
+      
+      // Handle both possible response formats
+      const parsedIntent = intentData.intent || intentData;
+      setIntent(parsedIntent);
+      toast.success('✅ Intent parsed successfully');
+
+      // Step 2: Get RAG context if needed
+      let contextData = null;
+      const needsRag = parsedIntent?.needs_rag !== false; // Default to true if not specified
+      
+      if (needsRag) {
+        setLoadingMessage('📚 Retrieving AWS best practices...');
+        try {
+          const ragResponse = await ragService.search(userInput);
+          contextData = ragResponse.results || ragResponse;
+          setRagContext(contextData);
+          toast.success(`✅ Retrieved ${Array.isArray(contextData) ? contextData.length : 0} best practices`);
+        } catch (ragError) {
+          console.warn('RAG retrieval failed, continuing without context:', ragError);
+          toast.warning('Continuing without best practices');
+        }
+      }
+
+      // Step 3: Generate code
+      setLoadingMessage('⚡ Generating Terraform code...');
+      const codeData = await aiService.generateCode(parsedIntent, contextData);
+      
+      setTerraformCode(codeData.terraform_code || '');
+      setExplanation(codeData.explanation || 'Infrastructure code generated');
+      setResources(codeData.resources_created || []);
+      setCostInfo(codeData.estimated_cost_info || 'Cost varies by usage');
+      
+      toast.success('✅ Terraform code generated!');
+      setCurrentStep(STEPS.GENERATED);
+    } catch (error) {
+      console.error('Generation error:', error);
+      toast.error(`Failed: ${error.response?.data?.detail || error.message}`);
+    } finally {
+      setLoading(false);
+      setLoadingMessage('');
+    }
+  };
+
+  const handleValidate = async () => {
+    setLoading(true);
+    try {
+      setLoadingMessage('🔍 Running validation checks...');
+      const result = await mcpService.validate(terraformCode);
+      setValidationResult(result);
+      toast.success('✅ Validation complete!');
+      setCurrentStep(STEPS.VALIDATED);
+    } catch (error) {
+      console.error('Validation error:', error);
+      toast.error(`Validation failed: ${error.response?.data?.detail || error.message}`);
+    } finally {
+      setLoading(false);
+      setLoadingMessage('');
+    }
+  };
+
+  const handleDeploy = async () => {
+    if (!deploymentName.trim()) {
+      toast.error('Please enter a deployment name');
+      return;
+    }
+    
+    if (!confirmDeploy) {
+      toast.error('Please confirm you understand this will create AWS resources');
+      return;
+    }
+
+    setLoading(true);
+    try {
+      // Step 1: Create deployment
+      setLoadingMessage('📦 Creating deployment...');
+      const deployment = await infraService.createDeployment(
+        terraformCode,
+        deploymentName
+      );
+      setDeploymentData(deployment);
+      toast.success(`✅ Deployment created: ${deployment.deployment_id}`);
+
+      // Step 2: Initialize
+      setLoadingMessage('🔧 Initializing Terraform...');
+      await infraService.initDeployment(deployment.deployment_id);
+      toast.success('✅ Terraform initialized');
+
+      // Step 3: Plan
+      setLoadingMessage('📋 Generating plan...');
+      const plan = await infraService.planDeployment(deployment.deployment_id);
+      toast.success(`✅ Plan ready: ${plan.plan_summary.add} to add`);
+
+      // Step 4: Apply
+      setLoadingMessage('🚀 Applying infrastructure...');
+      const result = await infraService.applyDeployment(deployment.deployment_id);
+      setDeploymentData(result);
+      toast.success('🎉 Infrastructure deployed successfully!');
+      setCurrentStep(STEPS.DEPLOYED);
+    } catch (error) {
+      console.error('Deployment error:', error);
+      toast.error(`Deployment failed: ${error.response?.data?.detail || error.message}`);
+    } finally {
+      setLoading(false);
+      setLoadingMessage('');
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-dark-bg text-gray-100">
+      <Toaster 
+        position="top-right"
+        toastOptions={{
+          duration: 4000,
+          style: {
+            background: '#151b2e',
+            color: '#fff',
+            border: '1px solid #1f2937',
+          },
+          success: {
+            iconTheme: {
+              primary: '#10b981',
+              secondary: '#fff',
+            },
+          },
+          error: {
+            iconTheme: {
+              primary: '#ef4444',
+              secondary: '#fff',
+            },
+          },
+        }}
+      />
+
+      {/* Header */}
+      <header className="bg-dark-surface border-b border-dark-border sticky top-0 z-50 backdrop-blur-sm bg-opacity-95">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center space-x-3">
+              <div className="w-10 h-10 bg-gradient-to-br from-primary-500 to-primary-700 rounded-lg flex items-center justify-center">
+                <Terminal className="w-6 h-6 text-white" />
+              </div>
+              <div>
+                <h1 className="text-2xl font-bold bg-gradient-to-r from-primary-400 to-primary-600 bg-clip-text text-transparent">
+                  AI DevOps Assistant
+                </h1>
+                <p className="text-sm text-gray-400">Natural Language to AWS Infrastructure</p>
+              </div>
+            </div>
+            
+            <div className="flex items-center space-x-4">
+              <button
+                onClick={() => setShowServiceStatus(!showServiceStatus)}
+                className="btn btn-secondary flex items-center space-x-2"
+              >
+                <Activity className="w-4 h-4" />
+                <span>Services</span>
+              </button>
+              
+              {currentStep > STEPS.INPUT && (
+                <button
+                  onClick={resetAll}
+                  className="btn btn-secondary flex items-center space-x-2"
+                >
+                  <RefreshCw className="w-4 h-4" />
+                  <span>New Request</span>
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      </header>
+
+      {/* Service Status Panel */}
+      {showServiceStatus && (
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
+          <ServiceStatus services={serviceHealth} onClose={() => setShowServiceStatus(false)} />
+        </div>
+      )}
+
+      {/* Progress Indicator */}
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
+        <div className="flex items-center justify-between">
+          {[
+            { step: STEPS.INPUT, label: 'Input', icon: Terminal },
+            { step: STEPS.GENERATED, label: 'Generated', icon: Code },
+            { step: STEPS.VALIDATED, label: 'Validated', icon: CheckCircle2 },
+            { step: STEPS.DEPLOYED, label: 'Deployed', icon: Rocket },
+          ].map((item, index) => (
+            <div key={item.step} className="flex items-center flex-1">
+              <div className={`flex flex-col items-center flex-1 ${
+                index === 3 ? '' : 'relative'
+              }`}>
+                <div className={`w-12 h-12 rounded-full flex items-center justify-center border-2 transition-all duration-300 ${
+                  currentStep > item.step
+                    ? 'bg-success-600 border-success-600'
+                    : currentStep === item.step
+                    ? 'bg-primary-600 border-primary-600 animate-pulse'
+                    : 'bg-dark-surface border-dark-border'
+                }`}>
+                  <item.icon className={`w-6 h-6 ${
+                    currentStep >= item.step ? 'text-white' : 'text-gray-500'
+                  }`} />
+                </div>
+                <span className={`mt-2 text-sm font-medium ${
+                  currentStep >= item.step ? 'text-gray-100' : 'text-gray-500'
+                }`}>
+                  {item.label}
+                </span>
+                
+                {index < 3 && (
+                  <div className={`absolute top-6 left-1/2 w-full h-0.5 transition-all duration-300 ${
+                    currentStep > item.step ? 'bg-success-600' : 'bg-dark-border'
+                  }`} style={{ transform: 'translateY(-50%)' }} />
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Main Content */}
+      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 pb-20">
+        {/* Loading Overlay */}
+        {loading && (
+          <div className="fixed inset-0 bg-black bg-opacity-50 backdrop-blur-sm z-40 flex items-center justify-center">
+            <div className="card p-8 max-w-md w-full mx-4 slide-in">
+              <div className="flex flex-col items-center space-y-4">
+                <Loader2 className="w-12 h-12 text-primary-500 animate-spin" />
+                <p className="text-lg font-medium text-gray-100">{loadingMessage}</p>
+                <div className="w-full bg-dark-hover rounded-full h-2 overflow-hidden">
+                  <div className="bg-primary-600 h-full rounded-full animate-pulse" style={{ width: '70%' }} />
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Content based on current step */}
+        {currentStep === STEPS.INPUT && (
+          <div className="space-y-6 slide-in">
+            <div className="card p-8">
+              <div className="flex items-center space-x-3 mb-6">
+                <Cloud className="w-8 h-8 text-primary-500" />
+                <h2 className="text-2xl font-bold">What infrastructure do you need?</h2>
+              </div>
+              
+              <textarea
+                value={userInput}
+                onChange={(e) => setUserInput(e.target.value)}
+                placeholder="Example: Create a production VPC with 2 public and 2 private subnets across 2 availability zones with NAT gateways"
+                className="input min-h-[200px] resize-none"
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && e.ctrlKey) {
+                    handleGenerate();
+                  }
+                }}
+              />
+              
+              <div className="mt-6 flex justify-between items-center">
+                <p className="text-sm text-gray-400">
+                  Press Ctrl+Enter or click the button to generate
+                </p>
+                <button
+                  onClick={handleGenerate}
+                  disabled={loading || !userInput.trim()}
+                  className="btn btn-primary flex items-center space-x-2 px-6 py-3 text-lg disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <Zap className="w-5 h-5" />
+                  <span>Generate Infrastructure</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Example Requests */}
+            <div className="card p-6">
+              <h3 className="text-lg font-semibold mb-4 flex items-center space-x-2">
+                <Terminal className="w-5 h-5 text-primary-500" />
+                <span>Example Requests</span>
+              </h3>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {[
+                  'Create a VPC with 2 public and 2 private subnets',
+                  'Set up an EC2 instance with Auto Scaling and Load Balancer',
+                  'Deploy a MySQL RDS database with Multi-AZ',
+                  'Create an S3 bucket with encryption and lifecycle policies',
+                ].map((example, index) => (
+                  <button
+                    key={index}
+                    onClick={() => setUserInput(example)}
+                    className="text-left p-4 bg-dark-hover hover:bg-dark-border rounded-lg border border-dark-border transition-colors duration-200"
+                  >
+                    <p className="text-sm text-gray-300">{example}</p>
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Additional steps content will be continued in next part... */}
+      </main>
+    </div>
+  );
+}
+
+export default App;

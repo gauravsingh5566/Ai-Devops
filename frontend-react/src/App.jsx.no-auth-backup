@@ -17,17 +17,13 @@ import {
   ChevronUp,
   AlertCircle,
   Server,
-  FileText,
-  LogOut,
-  MessageCircle
+  FileText
 } from 'lucide-react';
 import { aiService, ragService, mcpService, infraService, checkAllServices } from './services/api';
 import CodeEditor from './components/CodeEditor';
 import ValidationResults from './components/ValidationResults';
 import DeploymentProgress from './components/DeploymentProgress';
 import ServiceStatus from './components/ServiceStatus';
-import Login from './components/Login';
-import ChatInterface from './components/ChatInterface';
 
 const STEPS = {
   INPUT: 0,
@@ -39,17 +35,10 @@ const STEPS = {
 };
 
 function App() {
-  // Authentication state
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
-  const [username, setUsername] = useState('');
-  
   const [currentStep, setCurrentStep] = useState(STEPS.INPUT);
   const [userInput, setUserInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [loadingMessage, setLoadingMessage] = useState('');
-  
-  // Chat state
-  const [inputMode, setInputMode] = useState('manual'); // 'chat' or 'manual'
   
   // Data states
   const [intent, setIntent] = useState(null);
@@ -62,7 +51,6 @@ function App() {
   const [validationResult, setValidationResult] = useState(null);
   const [deploymentData, setDeploymentData] = useState(null);
   const [planData, setPlanData] = useState(null);  // NEW: Store Terraform plan
-  const [aiFixes, setAiFixes] = useState([]);  // NEW: Store AI fixes applied
   const [deploymentName, setDeploymentName] = useState('');
   const [confirmDeploy, setConfirmDeploy] = useState(false);
   
@@ -77,36 +65,12 @@ function App() {
   const [serviceHealth, setServiceHealth] = useState([]);
   const [showServiceStatus, setShowServiceStatus] = useState(false);
 
-  // Check authentication on mount
-  useEffect(() => {
-    const auth = localStorage.getItem('isAuthenticated');
-    const savedUsername = localStorage.getItem('username');
-    if (auth === 'true' && savedUsername) {
-      setIsAuthenticated(true);
-      setUsername(savedUsername);
-    }
-  }, []);
-
   // Check service health on mount
   useEffect(() => {
-    if (!isAuthenticated) return;
     checkServices();
     const interval = setInterval(checkServices, 30000);
     return () => clearInterval(interval);
-  }, [isAuthenticated]);
-
-  const handleLogin = (user) => {
-    setIsAuthenticated(true);
-    setUsername(user);
-  };
-
-  const handleLogout = () => {
-    localStorage.removeItem('isAuthenticated');
-    localStorage.removeItem('username');
-    setIsAuthenticated(false);
-    setUsername('');
-    resetAll();
-  };
+  }, []);
 
   const checkServices = async () => {
     try {
@@ -135,8 +99,6 @@ function App() {
     setCostInfo('');
     setValidationResult(null);
     setDeploymentData(null);
-    setPlanData(null);
-    setAiFixes([]);
     setDeploymentName('');
     setConfirmDeploy(false);
     setExpandedSections({
@@ -167,62 +129,6 @@ function App() {
     } catch (error) {
       console.error('Intent parsing error:', error);
       toast.error(`Failed: ${error.response?.data?.detail || error.message}`);
-    } finally {
-      setLoading(false);
-      setLoadingMessage('');
-    }
-  };
-
-  // Chat completion handler
-  const handleChatComplete = async (chatIntent, context) => {
-    console.log('✅ Chat completed:', chatIntent);
-    
-    try {
-      setLoading(true);
-      setLoadingMessage('Processing your requirements from chat...');
-      
-      // Set intent from chat
-      setIntent(chatIntent);
-      setUserInput(chatIntent.summary || chatIntent.user_request || 'Infrastructure from AI Chat');
-      
-      toast.success('✅ Requirements captured! Generating code...');
-      
-      // Auto-generate code
-      setCurrentStep(STEPS.INTENT_PARSED);
-      
-      // Optionally auto-generate immediately
-      setTimeout(() => {
-        handleGenerateCodeFromChat(chatIntent);
-      }, 500);
-      
-    } catch (error) {
-      console.error('Error after chat:', error);
-      toast.error('Failed to process chat: ' + error.message);
-    } finally {
-      setLoading(false);
-      setLoadingMessage('');
-      setInputMode('manual'); // Switch back to manual mode
-    }
-  };
-
-  const handleGenerateCodeFromChat = async (chatIntent) => {
-    setLoading(true);
-    try {
-      setLoadingMessage('⚡ Generating Terraform code from your chat...');
-      
-      const codeData = await aiService.generateCode(chatIntent, null);
-      
-      setTerraformCode(codeData.terraform_code || '');
-      setExplanation(codeData.explanation || 'Infrastructure code generated from chat');
-      setResources(codeData.resources_created || []);
-      setCostInfo(codeData.estimated_cost_info || 'Cost varies by usage');
-      
-      toast.success('✅ Terraform code generated from chat!');
-      setCurrentStep(STEPS.GENERATED);
-    } catch (error) {
-      console.error('Generation error:', error);
-      toast.error(`Failed: ${error.response?.data?.detail || error.message}`);
-      setCurrentStep(STEPS.INTENT_PARSED); // Go to intent review on error
     } finally {
       setLoading(false);
       setLoadingMessage('');
@@ -310,19 +216,7 @@ function App() {
       setLoadingMessage('📋 Generating plan...');
       const plan = await infraService.planDeployment(deployment.deployment_id);
       setPlanData(plan);  // Store plan data
-      
-      // Check if AI fixes were applied
-      if (plan.plan_output && plan.plan_output.includes('AI Auto-Fix Applied')) {
-        const fixesMatch = plan.plan_output.match(/AI Auto-Fix Applied:\n([\s\S]*?)\n\n/);
-        if (fixesMatch) {
-          const fixes = fixesMatch[1].split('\n').filter(f => f.trim());
-          setAiFixes(fixes);
-          toast.success(`✅ Plan ready with AI fixes: ${fixes.length} issue(s) resolved`, { duration: 5000 });
-        }
-      } else {
-        setAiFixes([]);
-        toast.success(`✅ Plan ready: ${plan.plan_summary?.add || 0} resources to add`);
-      }
+      toast.success(`✅ Plan ready: ${plan.plan_summary?.add || 0} resources to add`);
       
       // STOP HERE - Show plan for user review and approval
       setCurrentStep(STEPS.PLAN_REVIEW);
@@ -373,42 +267,27 @@ function App() {
         }}
       />
 
-      {/* Show login if not authenticated */}
-      {!isAuthenticated ? (
-        <Login onLogin={handleLogin} />
-      ) : (
-        <>
-          {/* Header */}
-          <header className="bg-dark-surface border-b border-dark-border sticky top-0 z-50">
-            <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center space-x-3">
-                  <div className="w-10 h-10 bg-gradient-to-br from-primary-500 to-primary-700 rounded-lg flex items-center justify-center">
-                    <Terminal className="w-6 h-6 text-white" />
-                  </div>
-                  <div>
-                    <h1 className="text-2xl font-bold bg-gradient-to-r from-primary-400 to-primary-600 bg-clip-text text-transparent">
-                      AI DevOps Assistant
-                    </h1>
-                    <p className="text-sm text-gray-400">Natural Language to AWS Infrastructure</p>
-                  </div>
-                </div>
-                
-                <div className="flex items-center space-x-4">
-                  {/* User info */}
-                  <div className="flex items-center space-x-2 px-3 py-2 bg-dark-hover rounded-lg">
-                    <div className="w-8 h-8 bg-primary-600 rounded-full flex items-center justify-center">
-                      <span className="text-sm font-semibold text-white">
-                        {username.charAt(0).toUpperCase()}
-                      </span>
-                    </div>
-                    <span className="text-sm text-gray-300">{username}</span>
-                  </div>
-                  
-                  <button
-                    onClick={() => setShowServiceStatus(!showServiceStatus)}
-                    className="btn btn-secondary flex items-center space-x-2"
-                  >
+      {/* Header */}
+      <header className="bg-dark-surface border-b border-dark-border sticky top-0 z-50">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center space-x-3">
+              <div className="w-10 h-10 bg-gradient-to-br from-primary-500 to-primary-700 rounded-lg flex items-center justify-center">
+                <Terminal className="w-6 h-6 text-white" />
+              </div>
+              <div>
+                <h1 className="text-2xl font-bold bg-gradient-to-r from-primary-400 to-primary-600 bg-clip-text text-transparent">
+                  AI DevOps Assistant
+                </h1>
+                <p className="text-sm text-gray-400">Natural Language to AWS Infrastructure</p>
+              </div>
+            </div>
+            
+            <div className="flex items-center space-x-4">
+              <button
+                onClick={() => setShowServiceStatus(!showServiceStatus)}
+                className="btn btn-secondary flex items-center space-x-2"
+              >
                 <Activity className="w-4 h-4" />
                 <span>Services</span>
               </button>
@@ -422,14 +301,6 @@ function App() {
                   <span>New Request</span>
                 </button>
               )}
-              
-              <button
-                onClick={handleLogout}
-                className="btn btn-danger flex items-center space-x-2"
-              >
-                <LogOut className="w-4 h-4" />
-                <span>Logout</span>
-              </button>
             </div>
           </div>
         </div>
@@ -494,112 +365,57 @@ function App() {
         {/* STEP 0: INPUT */}
         {currentStep === STEPS.INPUT && (
           <div className="space-y-6">
-            {/* Mode Selector */}
-            <div className="card p-6">
-              <h2 className="text-2xl font-bold mb-4 flex items-center space-x-3">
+            <div className="card p-8">
+              <div className="flex items-center space-x-3 mb-6">
                 <Cloud className="w-8 h-8 text-primary-500" />
-                <span>Create Infrastructure</span>
-              </h2>
+                <h2 className="text-2xl font-bold">What infrastructure do you need?</h2>
+              </div>
               
-              <div className="grid grid-cols-2 gap-4 mb-6">
+              <textarea
+                value={userInput}
+                onChange={(e) => setUserInput(e.target.value)}
+                placeholder="Example: Create a production VPC with 2 public and 2 private subnets across 2 availability zones with NAT gateways"
+                className="input min-h-[200px] resize-none"
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && e.ctrlKey) handleGenerate();
+                }}
+              />
+              
+              <div className="mt-6 flex justify-between items-center">
+                <p className="text-sm text-gray-400">Press Ctrl+Enter or click the button to generate</p>
                 <button
-                  onClick={() => setInputMode('chat')}
-                  className={`p-6 rounded-lg border-2 transition-all ${
-                    inputMode === 'chat'
-                      ? 'border-primary-500 bg-primary-500/10'
-                      : 'border-dark-border hover:border-gray-600'
-                  }`}
+                  onClick={handleParseIntent}
+                  disabled={loading || !userInput.trim()}
+                  className="btn btn-primary flex items-center space-x-2 px-6 py-3 text-lg disabled:opacity-50"
                 >
-                  <MessageCircle className="w-8 h-8 mx-auto mb-3 text-primary-500" />
-                  <div className="font-semibold text-lg mb-1">AI Chat</div>
-                  <div className="text-sm text-gray-400 mb-2">Guided questions</div>
-                  <div className="inline-block px-3 py-1 bg-primary-500 text-white text-xs rounded-full">
-                    ⭐ Recommended
-                  </div>
-                </button>
-                
-                <button
-                  onClick={() => setInputMode('manual')}
-                  className={`p-6 rounded-lg border-2 transition-all ${
-                    inputMode === 'manual'
-                      ? 'border-primary-500 bg-primary-500/10'
-                      : 'border-dark-border hover:border-gray-600'
-                  }`}
-                >
-                  <Terminal className="w-8 h-8 mx-auto mb-3 text-gray-400" />
-                  <div className="font-semibold text-lg mb-1">Manual Entry</div>
-                  <div className="text-sm text-gray-400">Type your requirements</div>
+                  <Zap className="w-5 h-5" />
+                  <span>Parse Requirements</span>
                 </button>
               </div>
             </div>
 
-            {/* Chat Mode */}
-            {inputMode === 'chat' && (
-              <div>
-                <ChatInterface 
-                  userId={username || 'guest'}
-                  onComplete={handleChatComplete}
-                />
-              </div>
-            )}
-
-            {/* Manual Mode */}
-            {inputMode === 'manual' && (
-              <div className="card p-8">
-                <div className="flex items-center space-x-3 mb-6">
-                  <Cloud className="w-8 h-8 text-primary-500" />
-                  <h2 className="text-2xl font-bold">What infrastructure do you need?</h2>
-                </div>
-                
-                <textarea
-                  value={userInput}
-                  onChange={(e) => setUserInput(e.target.value)}
-                  placeholder="Example: Create a production VPC with 2 public and 2 private subnets across 2 availability zones with NAT gateways"
-                  className="input min-h-[200px] resize-none"
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' && e.ctrlKey) handleParseIntent();
-                  }}
-                />
-                
-                <div className="mt-6 flex justify-between items-center">
-                  <p className="text-sm text-gray-400">Press Ctrl+Enter or click the button to generate</p>
+            <div className="card p-6">
+              <h3 className="text-lg font-semibold mb-4 flex items-center space-x-2">
+                <Terminal className="w-5 h-5 text-primary-500" />
+                <span>Example Requests</span>
+              </h3>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {[
+                  'Create a VPC with 2 public and 2 private subnets',
+                  'Set up an EC2 instance with Auto Scaling and Load Balancer',
+                  'Deploy a MySQL RDS database with Multi-AZ',
+                  'Create an S3 bucket with encryption and lifecycle policies',
+                ].map((example, index) => (
                   <button
-                    onClick={handleParseIntent}
-                    disabled={loading || !userInput.trim()}
-                    className="btn btn-primary flex items-center space-x-2 px-6 py-3 text-lg disabled:opacity-50"
+                    key={index}
+                    onClick={() => setUserInput(example)}
+                    className="text-left p-4 bg-dark-hover hover:bg-dark-border rounded-lg border border-dark-border transition-colors"
                   >
-                    <Zap className="w-5 h-5" />
-                    <span>Parse Requirements</span>
+                    <p className="text-sm text-gray-300">{example}</p>
                   </button>
-                </div>
+                ))}
               </div>
-            )}
-
-            {/* Examples (only show in manual mode) */}
-            {inputMode === 'manual' && (
-              <div className="card p-6">
-                <h3 className="text-lg font-semibold mb-4 flex items-center space-x-2">
-                  <Terminal className="w-5 h-5 text-primary-500" />
-                  <span>Example Requests</span>
-                </h3>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {[
-                    'Create a VPC with 2 public and 2 private subnets',
-                    'Set up an EC2 instance with Auto Scaling and Load Balancer',
-                    'Deploy a MySQL RDS database with Multi-AZ',
-                    'Create an S3 bucket with encryption and lifecycle policies',
-                  ].map((example, index) => (
-                    <button
-                      key={index}
-                      onClick={() => setUserInput(example)}
-                      className="text-left p-4 bg-dark-hover hover:bg-dark-border rounded-lg border border-dark-border transition-colors"
-                    >
-                      <p className="text-sm text-gray-300">{example}</p>
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
+            </div>
           </div>
         )}
 
@@ -1026,35 +842,6 @@ function App() {
                 </div>
               </div>
 
-              {/* AI Fixes Section - NEW */}
-              {aiFixes && aiFixes.length > 0 && (
-                <div className="mt-6 bg-blue-500/10 border-2 border-blue-500/30 rounded-lg p-6">
-                  <div className="flex items-start space-x-3 mb-4">
-                    <div className="w-10 h-10 bg-blue-600 rounded-full flex items-center justify-center flex-shrink-0">
-                      <Zap className="w-5 h-5 text-white" />
-                    </div>
-                    <div className="flex-1">
-                      <h4 className="font-semibold text-blue-400 text-lg mb-1">🤖 AI Auto-Fix Applied</h4>
-                      <p className="text-sm text-gray-300 mb-3">
-                        The AI agent detected and automatically fixed {aiFixes.length} issue(s) during plan generation:
-                      </p>
-                      <div className="space-y-2">
-                        {aiFixes.map((fix, index) => (
-                          <div key={index} className="flex items-start space-x-2 bg-dark-hover p-3 rounded-lg">
-                            <CheckCircle2 className="w-4 h-4 text-blue-400 flex-shrink-0 mt-0.5" />
-                            <span className="text-sm text-gray-200">{fix.replace(/^[•✓]\s*/, '')}</span>
-                          </div>
-                        ))}
-                      </div>
-                      <div className="mt-4 flex items-center space-x-2 text-xs text-blue-300">
-                        <Activity className="w-4 h-4" />
-                        <span>Powered by Gemini AI • Auto-validated and corrected</span>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              )}
-
               {/* Plan Output */}
               <div className="bg-dark-bg rounded-lg p-4 border border-dark-border">
                 <h3 className="text-sm font-semibold text-gray-300 mb-3 flex items-center">
@@ -1178,8 +965,6 @@ function App() {
           </div>
         )}
       </main>
-      </>
-      )}
     </div>
   );
 }

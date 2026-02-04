@@ -82,3 +82,7 @@ export function ServiceStatus({ services, onClose }) {
 }
 
 export default { DeploymentProgress, ServiceStatus };
+
+// Chat Components
+export { default as ChatInterface } from './ChatInterface';
+export { default as ChatInterfaceHTTP } from './ChatInterfaceHTTP';

@@ -3,7 +3,7 @@ AI Service - Gemini Integration
 Natural Language to Infrastructure Code Generation using Google Gemini
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List
@@ -17,6 +17,8 @@ import logging
 from datetime import datetime
 from plan_validator import create_plan_validator
 from rag_client import create_rag_client
+from chat_manager import ChatManager
+from conversation_ai import ConversationAI
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -59,6 +61,11 @@ rag_client = create_rag_client(RAG_SERVICE_URL)
 # Initialize Plan Validator with RAG connection
 plan_validator = create_plan_validator(model, terraform_store=rag_client)
 logger.info("Terraform Plan Validator initialized with RAG connection")
+
+# Initialize Chat Manager and Conversation AI
+chat_manager = ChatManager()
+conversation_ai = ConversationAI(model)
+logger.info("Chat system initialized")
 
 
 # ============== Pydantic Models ==============
@@ -709,6 +716,235 @@ async def validate_terraform_plan(request: ValidatePlanRequest):
             detail=f"Failed to validate plan: {str(e)}"
         )
 
+
+# ============== CHAT ENDPOINTS ==============
+
+@app.websocket("/ws/chat/{user_id}")
+async def chat_websocket(websocket: WebSocket, user_id: str):
+    """
+    WebSocket endpoint for real-time chat with AI
+    
+    Usage:
+    - Connect: ws://localhost:8001/ws/chat/user123
+    - Send: {"message": "Deploy microservices"}
+    - Receive: {"type": "message", "role": "assistant", "content": "...", "options": [...]}
+    """
+    await websocket.accept()
+    logger.info(f"Chat WebSocket connected: {user_id}")
+    
+    # Create new chat session
+    session = chat_manager.create_session(user_id)
+    
+    try:
+        # Send greeting
+        greeting = chat_manager.generate_greeting()
+        session.add_message('assistant', greeting)
+        
+        await websocket.send_json({
+            'type': 'message',
+            'role': 'assistant',
+            'content': greeting,
+            'session_id': session.session_id,
+            'progress': {
+                'current': 0,
+                'total': session.total_questions
+            }
+        })
+        
+        # Message loop
+        while True:
+            # Receive user message
+            data = await websocket.receive_json()
+            user_message = data.get('message', '')
+            
+            if not user_message:
+                continue
+            
+            logger.info(f"User message: {user_message[:100]}")
+            
+            # Add user message to session
+            session.add_message('user', user_message)
+            
+            # Determine conversation type from first message
+            if session.current_question == 1:
+                session.conversation_type = chat_manager.determine_conversation_type(user_message)
+                logger.info(f"Conversation type: {session.conversation_type}")
+            
+            # Generate AI response
+            ai_response = await conversation_ai.generate_response(session, user_message)
+            
+            # Add AI message to session
+            session.add_message('assistant', ai_response['message'], ai_response.get('options'))
+            
+            # Update progress
+            session.current_question += 1
+            
+            # Send response to client
+            response_data = {
+                'type': 'message',
+                'role': 'assistant',
+                'content': ai_response['message'],
+                'options': ai_response.get('options'),
+                'progress': {
+                    'current': session.current_question,
+                    'total': session.total_questions
+                }
+            }
+            
+            await websocket.send_json(response_data)
+            
+            # Check if conversation complete
+            if ai_response.get('complete'):
+                # Wait for user confirmation
+                confirm_data = await websocket.receive_json()
+                confirm_message = confirm_data.get('message', '').lower()
+                
+                if 'yes' in confirm_message or 'generate' in confirm_message:
+                    # Send completion with intent
+                    await websocket.send_json({
+                        'type': 'complete',
+                        'intent': ai_response['summary']['intent'],
+                        'context': ai_response['summary']['context'],
+                        'conversation_type': ai_response['summary']['conversation_type']
+                    })
+                    
+                    # Mark session as completed
+                    session.completed = True
+                    logger.info(f"Chat session completed: {session.session_id}")
+                    break
+                else:
+                    # User wants to change something
+                    await websocket.send_json({
+                        'type': 'message',
+                        'role': 'assistant',
+                        'content': "Sure! What would you like to change?",
+                        'options': None
+                    })
+                    session.current_question -= 1  # Go back
+    
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket disconnected: {user_id}")
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+        await websocket.send_json({
+            'type': 'error',
+            'message': f"An error occurred: {str(e)}"
+        })
+    finally:
+        # Clean up session after 1 hour
+        # (In production, you'd want to persist this to database)
+        pass
+
+
+@app.post("/chat/start")
+async def start_chat_session(user_id: str = "default"):
+    """
+    Start a new chat session (HTTP alternative to WebSocket)
+    
+    Returns session_id and greeting message
+    """
+    session = chat_manager.create_session(user_id)
+    greeting = chat_manager.generate_greeting()
+    session.add_message('assistant', greeting)
+    
+    return {
+        "session_id": session.session_id,
+        "message": greeting,
+        "progress": {
+            "current": 0,
+            "total": session.total_questions
+        }
+    }
+
+
+@app.post("/chat/message")
+async def send_chat_message(
+    session_id: str,
+    message: str
+):
+    """
+    Send message in existing chat session (HTTP alternative)
+    """
+    session = chat_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    # Add user message
+    session.add_message('user', message)
+    
+    # Determine conversation type from first message
+    if session.current_question == 1:
+        session.conversation_type = chat_manager.determine_conversation_type(message)
+    
+    # Generate AI response
+    ai_response = await conversation_ai.generate_response(session, message)
+    
+    # Add AI message
+    session.add_message('assistant', ai_response['message'], ai_response.get('options'))
+    
+    # Update progress
+    session.current_question += 1
+    
+    return {
+        "message": ai_response['message'],
+        "options": ai_response.get('options'),
+        "complete": ai_response.get('complete', False),
+        "summary": ai_response.get('summary'),
+        "progress": {
+            "current": session.current_question,
+            "total": session.total_questions
+        }
+    }
+
+
+@app.post("/chat/complete")
+async def complete_chat_session(session_id: str):
+    """
+    Mark chat session as complete and get final intent
+    """
+    session = chat_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    # Generate final summary
+    ai_response = await conversation_ai._generate_summary(session)
+    
+    session.completed = True
+    
+    return {
+        "intent": ai_response['summary']['intent'],
+        "context": ai_response['summary']['context'],
+        "conversation_type": ai_response['summary']['conversation_type'],
+        "message": "Chat completed successfully"
+    }
+
+
+@app.get("/chat/sessions")
+async def list_chat_sessions(user_id: str = "default"):
+    """List all chat sessions for a user"""
+    sessions = [
+        {
+            "session_id": s.session_id,
+            "created_at": s.created_at.isoformat(),
+            "completed": s.completed,
+            "message_count": len(s.messages),
+            "conversation_type": s.conversation_type
+        }
+        for s in chat_manager.sessions.values()
+        if s.user_id == user_id
+    ]
+    
+    return {"sessions": sessions}
+
+
+@app.delete("/chat/session/{session_id}")
+async def delete_chat_session(session_id: str):
+    """Delete a chat session"""
+    chat_manager.delete_session(session_id)
+    return {"message": "Session deleted"}
+
+
+# ============== HEALTH CHECK ==============
 
 @app.get("/health")
 async def health_check():

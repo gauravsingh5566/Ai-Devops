@@ -20,7 +20,7 @@ const Login = ({ onLogin }) => {
     }
 
     // Demo credentials (replace with real authentication)
-    if (username === 'admin' && password === '9900') {
+    if (username === 'admin' && password === 'admin123') {
       localStorage.setItem('isAuthenticated', 'true');
       localStorage.setItem('username', username);
       onLogin(username);
