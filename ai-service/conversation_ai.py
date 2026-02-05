@@ -65,7 +65,15 @@ class ConversationAI:
         else:
             # Store user's answer in context for subsequent questions
             prev_question_id = questions[session.current_question - 2]['id']
-            session.context[prev_question_id] = user_message
+            
+            # Normalize the answer (handle both value and label)
+            normalized_answer = self._normalize_answer(
+                user_message, 
+                questions[session.current_question - 2]
+            )
+            
+            session.context[prev_question_id] = normalized_answer
+            logger.info(f"Stored answer: {prev_question_id} = {normalized_answer}")
         
         # Find next unanswered question
         question_idx = session.current_question - 1
@@ -113,6 +121,48 @@ class ConversationAI:
             'summary': None,
             'context_update': {}
         }
+    
+    def _normalize_answer(self, answer: str, question: Dict) -> str:
+        """Normalize answer to match expected values"""
+        answer_lower = answer.lower().strip()
+        
+        # If question has options, try to match to value
+        if 'options' in question:
+            for option in question['options']:
+                # Check if answer matches the value exactly (e.g., "eks")
+                if option['value'].lower() == answer_lower:
+                    logger.info(f"Matched answer '{answer}' to value '{option['value']}'")
+                    return option['value']
+                
+                # Check if answer matches the label (user clicked button text)
+                if option['label'].lower() in answer_lower or answer_lower in option['label'].lower():
+                    logger.info(f"Matched answer '{answer}' to label, returning value '{option['value']}'")
+                    return option['value']
+        
+        # For platform specifically (extra safety)
+        if question.get('id') == 'platform':
+            if 'eks' in answer_lower or 'kubernetes' in answer_lower:
+                logger.info(f"Platform answer normalized to 'eks' from '{answer}'")
+                return 'eks'
+            elif 'ecs' in answer_lower or 'fargate' in answer_lower:
+                logger.info(f"Platform answer normalized to 'ecs' from '{answer}'")
+                return 'ecs'
+            elif 'ec2' in answer_lower:
+                logger.info(f"Platform answer normalized to 'ec2' from '{answer}'")
+                return 'ec2'
+        
+        # For traffic
+        if question.get('id') == 'traffic':
+            if 'low' in answer_lower:
+                return 'low'
+            elif 'medium' in answer_lower:
+                return 'medium'
+            elif 'high' in answer_lower:
+                return 'high'
+        
+        # Return as-is if no normalization needed
+        logger.info(f"No normalization needed for answer '{answer}'")
+        return answer
     
     def _extract_info_from_message(self, message: str, questions: List[Dict]) -> Dict:
         """Extract information from user's message"""
@@ -260,10 +310,48 @@ Format as friendly, clear text. Include emojis. Be specific about AWS services.
         
         # Extract resources based on conversation type
         if session.conversation_type == 'microservices':
-            intent['resources'].extend([
-                'vpc', 'subnet', 'ecs', 'ecs_service', 
-                'alb', 'target_group', 'security_group'
-            ])
+            # Check which platform user selected
+            platform = session.context.get('platform', 'ecs')
+            logger.info(f"Building intent for microservices with platform: {platform}")
+            logger.info(f"Full context: {session.context}")
+            
+            # Base networking resources
+            intent['resources'].extend(['vpc', 'subnet', 'security_group'])
+            
+            # Platform-specific resources
+            if platform == 'eks':
+                # EKS (Kubernetes)
+                logger.info("Adding EKS resources")
+                intent['resources'].extend([
+                    'eks_cluster',
+                    'eks_node_group',
+                    'iam_role',
+                    'alb',
+                    'target_group'
+                ])
+                intent['requirements'].append('EKS (Kubernetes) cluster')
+            elif platform == 'ec2':
+                # EC2 with Docker
+                logger.info("Adding EC2 resources")
+                intent['resources'].extend([
+                    'ec2',
+                    'launch_template',
+                    'autoscaling_group',
+                    'alb',
+                    'target_group'
+                ])
+                intent['requirements'].append('EC2 instances with Docker')
+            else:
+                # ECS Fargate (default)
+                logger.info(f"Adding ECS resources (platform={platform})")
+                intent['resources'].extend([
+                    'ecs',
+                    'ecs_service',
+                    'ecs_task_definition',
+                    'alb',
+                    'target_group'
+                ])
+                intent['requirements'].append('ECS Fargate cluster')
             
             # Add database if specified
             databases = session.context.get('databases', '')
@@ -276,12 +364,20 @@ Format as friendly, clear text. Include emojis. Be specific about AWS services.
             
             # Build requirements
             count = session.context.get('count', '5')
+            platform = session.context.get('platform', 'ecs')
             intent['requirements'].append(f"{count} microservices")
             
             traffic = session.context.get('traffic', 'medium')
             intent['requirements'].append(f"{traffic} traffic")
             
-            intent['summary'] = f"Deploy {count} microservices with {traffic} traffic"
+            # Build summary with platform
+            platform_names = {
+                'eks': 'EKS (Kubernetes)',
+                'ecs': 'ECS Fargate',
+                'ec2': 'EC2 with Docker'
+            }
+            platform_name = platform_names.get(platform, 'ECS Fargate')
+            intent['summary'] = f"Deploy {count} microservices on {platform_name} with {traffic} traffic"
         
         elif session.conversation_type == 'web_app':
             intent['resources'].extend(['vpc', 'subnet', 'ec2', 'alb', 'security_group'])
