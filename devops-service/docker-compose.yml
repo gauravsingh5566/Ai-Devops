@@ -1,0 +1,168 @@
+version: '3.8'
+
+services:
+  # Frontend - React Dashboard
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: devops-frontend
+    ports:
+      - "3000:80"
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    depends_on:
+      - api-gateway
+    networks:
+      - devops-network
+    restart: unless-stopped
+
+  # API Gateway - Central entry point
+  api-gateway:
+    build:
+      context: .
+      dockerfile: ./api-gateway/Dockerfile
+    container_name: devops-api-gateway
+    ports:
+      - "8000:8000"
+    environment:
+      - BUILD_AGENT_URL=http://build-agent:8001
+      - GITHUB_AGENT_URL=http://github-agent:8007
+      - MONGODB_URL=mongodb://devops:devops123@mongodb:27017/devops?authSource=admin
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - mongodb
+      - redis
+      - build-agent
+    networks:
+      - devops-network
+    restart: unless-stopped
+
+  # Build Agent - Docker container builder
+  build-agent:
+    build:
+      context: .
+      dockerfile: ./agents/build-agent/Dockerfile
+    container_name: devops-build-agent
+    ports:
+      - "8001:8001"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - shared_workspace:/workspace
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - MONGODB_URL=mongodb://devops:devops123@mongodb:27017/devops?authSource=admin
+      - REDIS_URL=redis://redis:6379/0
+    networks:
+      - devops-network
+    restart: unless-stopped
+
+  # GitHub Agent - Project import from GitHub
+  github-agent:
+    build:
+      context: .
+      dockerfile: ./agents/github-agent/Dockerfile
+    container_name: devops-github-agent
+    ports:
+      - "8007:8007"
+    volumes:
+      - shared_workspace:/workspace
+    environment:
+      - MONGODB_URL=mongodb://devops:devops123@mongodb:27017/devops?authSource=admin
+      - WORKSPACE_DIR=/workspace
+    networks:
+      - devops-network
+    restart: unless-stopped
+
+  # Docker Agent - Advanced Docker builder with LLM validation
+  docker-agent:
+    build:
+      context: .
+      dockerfile: ./agents/docker-agent/Dockerfile
+    container_name: devops-docker-agent
+    ports:
+      - "8002:8002"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - shared_workspace:/workspace
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+    networks:
+      - devops-network
+    restart: unless-stopped
+
+  # MongoDB Database
+  mongodb:
+    image: mongo:7-jammy
+    container_name: devops-mongodb
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=devops
+      - MONGO_INITDB_ROOT_PASSWORD=devops123
+      - MONGO_INITDB_DATABASE=devops
+    volumes:
+      - mongodb_data:/data/db
+      - mongodb_config:/data/configdb
+    ports:
+      - "27017:27017"
+    networks:
+      - devops-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: devops-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - devops-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # RabbitMQ Message Queue
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: devops-rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      - RABBITMQ_DEFAULT_USER=devops
+      - RABBITMQ_DEFAULT_PASS=devops123
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - devops-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  devops-network:
+    driver: bridge
+
+volumes:
+  mongodb_data:
+    driver: local
+  mongodb_config:
+    driver: local
+  redis_data:
+    driver: local
+  rabbitmq_data:
+    driver: local
+  shared_workspace:
+    driver: local
